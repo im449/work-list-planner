@@ -1,3 +1,13 @@
+# work-list-planner
+
+Канбан-планировщик задач (MVP) на стеке Python + FastAPI. Учебный проект для портфолио.
+
+🔗 Демо: [work-list.ru](https://work-list.ru) (вход в админку: `/admin`)
+
+## Стек
+- Backend: Python, FastAPI, SQLite
+- Frontend: HTML, CSS, Vanilla JS
+
 ## Возможности
 - Канбан-интерфейс: создание, редактирование, перемещение и архивация задач
 - Административная панель с авторизацией (`/admin`)
