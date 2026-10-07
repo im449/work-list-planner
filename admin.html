@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Админка — Work List</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 22px; }
+  .login { max-width: 320px; display: flex; flex-direction: column; gap: 10px; }
+  input, button { padding: 8px; font-size: 15px; }
+  button { cursor: pointer; }
+  table { border-collapse: collapse; width: 100%; margin-top: 16px; }
+  th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+  th { background: #f5f5f5; }
+  .err { color: #b00; }
+  .actions button { margin-right: 6px; }
+  .role-badge { padding: 2px 8px; border-radius: 10px; font-size: 13px; }
+  .admin { background: #ffe9b3; }
+  .user { background: #e3eefc; }
+</style>
+</head>
+<body>
+<h1>Панель администратора</h1>
+<div id="loginBox" class="login">
+  <input id="username" placeholder="Логин" autocomplete="username">
+  <input id="password" type="password" placeholder="Пароль" autocomplete="current-password">
+  <button onclick="login()">Войти</button>
+  <div id="loginErr" class="err"></div>
+</div>
+<div id="panel" style="display:none">
+  <p>Вы вошли как <b id="me"></b>. <button onclick="logout()">Выйти</button></p>
+  <table id="usersTable">
+    <thead><tr><th>ID</th><th>Логин</th><th>Роль</th><th>Задач</th><th>Регистрация</th><th>Действия</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <div id="panelErr" class="err"></div>
+</div>
+<script>
+const API = '';
+const tokenKey = 'adminToken';
+function getToken(){ return localStorage.getItem(tokenKey); }
+
+async function login(){
+  const r = await fetch(API + '/token', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: new URLSearchParams({username: username.value, password: password.value})
+  });
+  if (!r.ok){ loginErr.textContent = 'Неверный логин или пароль'; return; }
+  const d = await r.json();
+  localStorage.setItem(tokenKey, d.access_token);
+  username.value = password.value = loginErr.textContent = '';
+  load();
+}
+
+function logout(){ localStorage.removeItem(tokenKey); location.reload(); }
+
+async function load(){
+  const t = getToken();
+  if (!t) return;
+  const r = await fetch(API + '/admin/users', {headers: {'Authorization': 'Bearer ' + t}});
+  if (r.status === 401){ localStorage.removeItem(tokenKey); return; }
+  if (r.status === 403){ panelErr.textContent = 'Этот аккаунт не администратор'; return; }
+  loginBox.style.display = 'none';
+  panel.style.display = 'block';
+  const users = await r.json();
+  const tbody = document.querySelector('#usersTable tbody');
+  tbody.innerHTML = '';
+  for (const u of users){
+    const tr = document.createElement('tr');
+    const isAdmin = u.role === 'admin';
+    tr.innerHTML = `<td>${u.id}</td><td>${u.username}</td>
+      <td><span class="role-badge ${u.role}">${isAdmin ? 'админ' : 'пользователь'}</span></td>
+      <td>${u.task_count}</td><td>${u.created_at || ''}</td>
+      <td class="actions"></td>`;
+    const cell = tr.querySelector('.actions');
+    const toggle = document.createElement('button');
+    toggle.textContent = isAdmin ? 'Снять админа' : 'Сделать админом';
+    toggle.onclick = () => setRole(u.id, isAdmin ? 'user' : 'admin');
+    cell.appendChild(toggle);
+    const del = document.createElement('button');
+    del.textContent = 'Удалить';
+    del.onclick = () => { if (confirm('Удалить пользователя ' + u.username + ' и все его задачи?')) deleteUser(u.id); };
+    cell.appendChild(del);
+    tbody.appendChild(tr);
+  }
+}
+
+async function setRole(id, role){
+  const r = await fetch(API + `/admin/users/${id}/role`, {
+    method: 'POST',
+    headers: {'Authorization': 'Bearer ' + getToken(), 'Content-Type': 'application/json'},
+    body: JSON.stringify({role})
+  });
+  if (!r.ok) panelErr.textContent = (await r.json()).detail || 'Ошибка';
+  load();
+}
+
+async function deleteUser(id){
+  const r = await fetch(API + `/admin/users/${id}`, {
+    method: 'DELETE',
+    headers: {'Authorization': 'Bearer ' + getToken()}
+  });
+  if (!r.ok) panelErr.textContent = (await r.json()).detail || 'Ошибка';
+  load();
+}
+
+load();
+</script>
+</body>
+</html>

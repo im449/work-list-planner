@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Канбан-планнер</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; background: #f0f2f5; padding: 12px; }
+
+    #login-screen { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: none; justify-content: center; align-items: center; z-index: 999; }
+    .auth-box { background: white; padding: 24px; border-radius: 8px; width: 320px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); text-align: center; }
+    .auth-box h2 { margin-bottom: 16px; color: #333; }
+    .auth-box input { width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; }
+    .auth-box button { padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; width: 100%; }
+    .auth-box button:hover { background: #0056b3; }
+    .switch-mode { margin-top: 12px; font-size: 13px; color: #555; cursor: pointer; }
+    .switch-mode:hover { text-decoration: underline; }
+    .error { color: #dc3545; margin-top: 8px; font-size: 13px; display: none; }
+
+    .top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    h1 { color: #333; }
+    .user-info { font-size: 13px; color: #666; }
+    .btn-logout { padding: 4px 12px; background: #6c757d; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
+    .btn-logout:hover { background: #5a6268; }
+
+    .layout { display: flex; gap: 14px; flex-wrap: wrap; }
+    .sidebar { flex: 0 0 300px; max-width: 100%; }
+    .main-area { flex: 1; min-width: 320px; }
+
+    .form-block { background: white; padding: 14px; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.1); }
+    .form-block input, .form-block textarea { width: 100%; padding: 6px; margin-bottom: 6px; border: 1px solid #ccc; border-radius: 4px; }
+    .form-block button { padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; width: 100%; margin-top: 4px; }
+    .form-block button:hover { background: #0056b3; }
+    .btn-pdf { background: #28a745; margin-top: 8px; }
+    .btn-pdf:hover { background: #1e7e34; }
+    .btn-archive-all { background: #6f42c1; margin-top: 8px; }
+    .btn-archive-all:hover { background: #5a32a3; }
+    .btn-toggle-archive { background: #17a2b8; margin-top: 8px; }
+    .btn-toggle-archive:hover { background: #117a8b; }
+
+    .board { display: flex; gap: 12px; }
+    .column { flex: 1; background: #ebecf0; border-radius: 8px; padding: 10px; min-height: 200px; }
+    .column h3 { text-align: center; margin-bottom: 10px; color: #555; font-size: 15px; }
+
+    .card { background: white; border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.12); }
+    .card-title { font-weight: bold; margin-bottom: 3px; color: #333; font-size: 14px; }
+    .card-date { font-size: 11px; color: #888; margin-bottom: 4px; }
+    .card-desc { font-size: 12px; color: #666; margin-bottom: 6px; }
+    .card-actions { display: flex; gap: 3px; flex-wrap: wrap; }
+    .card-actions button { padding: 3px 7px; font-size: 11px; border: none; border-radius: 3px; cursor: pointer; color: white; }
+    .btn-todo { background: #dc3545; }
+    .btn-progress { background: #fd7e14; }
+    .btn-done { background: #28a745; }
+    .btn-del { background: #6c757d; }
+    .btn-archive-one { background: #6f42c1; }
+    .btn-restore { background: #17a2b8; }
+
+    #archive-list { display: none; }
+    .archive-header { margin-bottom: 10px; color: #555; font-size: 15px; }
+    .archive-empty { color: #888; font-size: 14px; background: white; border-radius: 8px; padding: 16px; text-align: center; }
+  </style>
+</head>
+<body>
+
+  <div id="login-screen">
+    <div class="auth-box">
+      <h2 id="auth-title">Вход</h2>
+      <input id="auth-username" placeholder="Логин">
+      <input id="auth-password" type="password" placeholder="Пароль">
+      <button id="auth-btn" onclick="handleAuth()">Войти</button>
+      <div id="auth-error" class="error"></div>
+      <div class="switch-mode" onclick="toggleMode()">Регистрация</div>
+    </div>
+  </div>
+
+  <div class="top-bar">
+    <h1>Планировщик задач</h1>
+    <div class="user-info">
+      <span id="current-user"></span>
+      <button class="btn-logout" onclick="logout()">Выйти</button>
+    </div>
+  </div>
+
+  <div class="layout">
+    <div class="sidebar">
+      <div class="form-block">
+        <input id="title" placeholder="Название задачи">
+        <input id="dueDate" type="date">
+        <textarea id="description" rows="3" placeholder="Описание"></textarea>
+        <button onclick="addTask()">Добавить задачу</button>
+        <button class="btn-pdf" onclick="downloadPDF()">Скачать PDF-отчёт</button>
+        <button class="btn-archive-all" onclick="archiveDone()">В архив выполненные</button>
+        <button class="btn-toggle-archive" id="btn-toggle" onclick="toggleArchive()">Архив</button>
+      </div>
+    </div>
+
+    <div class="main-area">
+      <div class="board" id="board">
+        <div class="column"><h3>Сделать</h3><div id="col-todo"></div></div>
+        <div class="column"><h3>В работе</h3><div id="col-progress"></div></div>
+        <div class="column"><h3>Завершено</h3><div id="col-done"></div></div>
+      </div>
+      <div id="archive-list">
+        <div class="archive-header">Архив выполненных задач</div>
+        <div id="archive-items"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+function escapeHtml(t){if(!t)return'';return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');}
+
+let isRegisterMode = false;
+let archiveMode = false;
+
+function toggleMode() {
+  isRegisterMode = !isRegisterMode;
+  const title = document.getElementById('auth-title');
+  const btn = document.getElementById('auth-btn');
+  const switchText = document.querySelector('.switch-mode');
+  if (isRegisterMode) {
+    title.innerText = 'Регистрация';
+    btn.innerText = 'Зарегистрироваться';
+    switchText.innerText = 'Уже есть аккаунт? Войти';
+  } else {
+    title.innerText = 'Вход';
+    btn.innerText = 'Войти';
+    switchText.innerText = 'Регистрация';
+  }
+  document.getElementById('auth-error').style.display = 'none';
+}
+
+function showLoginScreen() {
+  document.getElementById('login-screen').style.display = 'flex';
+}
+
+function hideLoginScreen() {
+  document.getElementById('login-screen').style.display = 'none';
+}
+
+async function handleAuth() {
+  const username = document.getElementById('auth-username').value.trim();
+  const password = document.getElementById('auth-password').value;
+  const errorEl = document.getElementById('auth-error');
+  errorEl.style.display = 'none';
+
+  if (!username || !password) {
+    errorEl.innerText = 'Заполните логин и пароль';
+    errorEl.style.display = 'block';
+    return;
+  }
+
+  const url = isRegisterMode ? '/register' : '/token';
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'username=' + encodeURIComponent(username) + '&password=' + encodeURIComponent(password)
+    });
+
+    if (!res.ok) {
+      let msg = 'Ошибка сервера';
+      try {
+        const errData = await res.json();
+        msg = errData.detail || msg;
+      } catch(e) {}
+      throw new Error(msg);
+    }
+
+    const data = await res.json();
+
+    if (isRegisterMode) {
+      alert('Пользователь создан. Теперь войдите.');
+      toggleMode();
+    } else {
+      localStorage.setItem('auth_token', data.access_token);
+      localStorage.setItem('username', username);
+      document.getElementById('current-user').innerText = 'Вы: ' + username;
+      hideLoginScreen();
+      loadTasks();
+    }
+  } catch (err) {
+    errorEl.innerText = err.message || 'Ошибка авторизации';
+    errorEl.style.display = 'block';
+  }
+}
+
+function logout() {
+  localStorage.removeItem('auth_token');
+  localStorage.removeItem('username');
+  document.getElementById('current-user').innerText = '';
+  showLoginScreen();
+}
+
+function getAuthHeaders() {
+  const token = localStorage.getItem('auth_token');
+  return {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer ' + (token || '')
+  };
+}
+
+function toggleArchive() {
+  archiveMode = !archiveMode;
+  document.getElementById('btn-toggle').innerText = archiveMode ? '← Канбан' : 'Архив';
+  document.getElementById('board').style.display = archiveMode ? 'none' : 'flex';
+  document.getElementById('archive-list').style.display = archiveMode ? 'block' : 'none';
+  loadTasks();
+}
+
+async function archiveDone() {
+  const res = await fetch('/tasks/archive-done', { method: 'POST', headers: getAuthHeaders() });
+  if (res.status === 401) {
+    localStorage.removeItem('auth_token');
+    showLoginScreen();
+    return;
+  }
+  if (!res.ok) { alert('Ошибка архивации'); return; }
+  const d = await res.json();
+  if (archiveMode) loadTasks(); else loadTasks();
+  alert(d.archived > 0 ? 'В архив перемещено задач: ' + d.archived : 'Выполненных задач не найдено');
+}
+
+async function restoreTask(id) {
+  await fetch('/tasks/' + id + '/restore', { method: 'POST', headers: getAuthHeaders() });
+  loadTasks();
+}
+
+async function loadTasks() {
+  try {
+    var url = archiveMode ? '/tasks?archived=true' : '/tasks';
+    var res = await fetch(url, { headers: getAuthHeaders() });
+    if (res.status === 401) {
+      localStorage.removeItem('auth_token');
+      showLoginScreen();
+      return;
+    }
+    if (!res.ok) throw new Error('Ошибка загрузки');
+    var tasks = await res.json();
+
+    if (archiveMode) {
+      var box = document.getElementById('archive-items');
+      box.innerHTML = '';
+      if (!tasks.length) {
+        box.innerHTML = '<div class="archive-empty">Архив пуст</div>';
+        return;
+      }
+      tasks.forEach(function(t) {
+        var card = document.createElement('div');
+        card.className = 'card';
+        var html = '<div class="card-title">' + escapeHtml(t.title) + '</div>';
+        if (t.dueDate) html += '<div class="card-date">До: ' + escapeHtml(t.dueDate) + '</div>';
+        if (t.description) html += '<div class="card-desc">' + escapeHtml(t.description) + '</div>';
+        html += '<div class="card-actions">';
+        html += '<button class="btn-restore" onclick="restoreTask(' + t.id + ')">Вернуть</button>';
+        html += '<button class="btn-del" onclick="deleteTask(' + t.id + ')">Удалить</button>';
+        html += '</div>';
+        card.innerHTML = html;
+        box.appendChild(card);
+      });
+      return;
+    }
+
+    document.getElementById('col-todo').innerHTML = '';
+    document.getElementById('col-progress').innerHTML = '';
+    document.getElementById('col-done').innerHTML = '';
+
+    tasks.forEach(function(t) {
+      var card = document.createElement('div');
+      card.className = 'card';
+      var html = '<div class="card-title">' + escapeHtml(t.title) + '</div>';
+      if (t.dueDate) html += '<div class="card-date">До: ' + escapeHtml(t.dueDate) + '</div>';
+      if (t.description) html += '<div class="card-desc">' + escapeHtml(t.description) + '</div>';
+      html += '<div class="card-actions">';
+      html += '<button class="btn-todo" onclick="setStatus(' + t.id + ',\'todo\')">Сделать</button>';
+      html += '<button class="btn-progress" onclick="setStatus(' + t.id + ',\'progress\')">В работу</button>';
+      html += '<button class="btn-done" onclick="setStatus(' + t.id + ',\'done\')">Завершить</button>';
+      if (t.status === 'done') html += '<button class="btn-archive-one" onclick="archiveOne(' + t.id + ')">В архив</button>';
+      html += '<button class="btn-del" onclick="deleteTask(' + t.id + ')">Удалить</button>';
+      html += '</div>';
+      card.innerHTML = html;
+      var col = document.getElementById('col-' + t.status);
+      if (col) col.appendChild(card);
+    });
+  } catch (err) {
+    console.error('Ошибка:', err);
+  }
+}
+
+async function archiveOne(id) {
+  await fetch('/tasks/' + id + '/archive', { method: 'POST', headers: getAuthHeaders() });
+  loadTasks();
+}
+
+async function addTask() {
+  var title = document.getElementById('title').value.trim();
+  if (!title) { alert('Введите название'); return; }
+  var dueDate = document.getElementById('dueDate').value;
+  var description = document.getElementById('description').value;
+
+  await fetch('/tasks', {
+    method: 'POST',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ title: title, dueDate: dueDate, description: description })
+  });
+
+  document.getElementById('title').value = '';
+  document.getElementById('dueDate').value = '';
+  document.getElementById('description').value = '';
+  loadTasks();
+}
+
+async function setStatus(id, status) {
+  await fetch('/tasks/' + id, {
+    method: 'PUT',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ status: status })
+  });
+  loadTasks();
+}
+
+async function deleteTask(id) {
+  if (!confirm('Удалить задачу?')) return;
+  await fetch('/tasks/' + id, { method: 'DELETE', headers: getAuthHeaders() });
+  loadTasks();
+}
+
+async function downloadPDF() {
+  const token = localStorage.getItem('auth_token');
+  if (!token) {
+    alert('Сначала войдите в систему');
+    showLoginScreen();
+    return;
+  }
+  try {
+    const res = await fetch('/report', { headers: getAuthHeaders() });
+    if (res.status === 401) {
+      localStorage.removeItem('auth_token');
+      showLoginScreen();
+      alert('Сессия истекла. Войдите снова.');
+      return;
+    }
+    if (!res.ok) throw new Error('Ошибка сервера: ' + res.status);
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'weekly_report.pdf';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+  } catch (err) {
+    console.error(err);
+    alert('Ошибка скачивания PDF: ' + err.message);
+  }
+}
+
+// === Старт страницы ===
+const savedToken = localStorage.getItem('auth_token');
+const savedUsername = localStorage.getItem('username');
+
+if (savedToken) {
+  if (savedUsername) {
+    document.getElementById('current-user').innerText = 'Вы: ' + savedUsername;
+  }
+  hideLoginScreen();
+  loadTasks();
+} else {
+  showLoginScreen();
+}
+</script>
+</body>
+</html>

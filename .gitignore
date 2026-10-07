@@ -1,0 +1,24 @@
+# База данных и бэкапы
+*.db
+*.sqlite*
+*.bak*
+backups/
+
+# Виртуальное окружение
+venv/
+.venv/
+
+# Логи и временные файлы
+*.log
+nohup.out
+report.pdf
+
+# Python-кэш
+__pycache__/
+*.pyc
+
+# IDE и система
+.idea/
+.vscode/
+.DS_Store
+*.save
