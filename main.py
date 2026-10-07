@@ -2,15 +2,17 @@ from fastapi import FastAPI, Response, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fpdf import FPDF
-import sqlite3
 import os
+import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 
 # === НАСТРОЙКИ АВТОРИЗАЦИИ ===
-SECRET_KEY = "05802d054b8bdab15c229de86a70b98d4c901c1fd9359cbb940dfd255d356097"
+SECRET_KEY = os.environ.get("SECRET_KEY", "")
+if not SECRET_KEY:
+    raise RuntimeError("SECRET_KEY is not set. Check .env / systemd EnvironmentFile")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
