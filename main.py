@@ -1,7 +1,7 @@
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from fastapi import FastAPI, Response, HTTPException, Depends, status, Request  # Добавлен Request
+from fastapi import FastAPI, Response, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fpdf import FPDF
@@ -23,6 +23,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI()
+
 # ИСПРАВЛЕНИЕ: Убрали default_limits. Теперь лимиты только на конкретных роутах.
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
@@ -34,6 +35,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
+
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "planner.db"))
 
 def db():
@@ -52,7 +54,8 @@ def init_db():
             due_date TEXT,
             status TEXT DEFAULT 'todo',
             description TEXT DEFAULT '',
-            user_id INTEGER
+            user_id INTEGER,
+            archived INTEGER DEFAULT 0
         )
     """)
     c.execute("""
@@ -68,6 +71,7 @@ def init_db():
     user_cols = [r["name"] for r in c.execute("PRAGMA table_info(users)")]
     if "role" not in user_cols:
         c.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'")
+    
     task_cols = [r["name"] for r in c.execute("PRAGMA table_info(tasks)")]
     if "user_id" not in task_cols:
         c.execute("ALTER TABLE tasks ADD COLUMN user_id INTEGER")
@@ -75,8 +79,10 @@ def init_db():
         # и забирает все существующие задачи себе
         c.execute("UPDATE users SET role='admin' WHERE id = (SELECT MIN(id) FROM users)")
         c.execute("UPDATE tasks SET user_id = (SELECT MIN(id) FROM users) WHERE user_id IS NULL")
+    
     if "archived" not in task_cols:
         c.execute("ALTER TABLE tasks ADD COLUMN archived INTEGER DEFAULT 0")
+    
     conn.commit()
     conn.close()
 
@@ -133,7 +139,8 @@ async def require_admin(user: dict = Depends(get_current_user)):
 # === ЭНДПОИНТЫ АВТОРИЗАЦИИ ===
 @app.post("/token")
 @limiter.limit("10/minute")  # Лимит только на логин
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+    # request добавлен первым аргументом для корректной работы slowapi
     user = authenticate_user(form_data.username, form_data.password)
     if not user:
         raise HTTPException(
@@ -148,8 +155,9 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/register")
-@limiter.limit("5/minute")  # Лимит только на регистрацию
-async def register_user(form_data: OAuth2PasswordRequestForm = Depends()):
+@limiter.limit("5/minute")
+async def register_user(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+    # request добавлен первым аргументом
     conn = db()
     if conn.execute("SELECT 1 FROM users WHERE username = ?", (form_data.username,)).fetchone():
         conn.close()
