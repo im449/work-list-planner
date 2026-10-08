@@ -1,4 +1,7 @@
-from fastapi import FastAPI, Response, HTTPException, Depends, status
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from fastapi import FastAPI, Response, HTTPException, Depends, status, Request  # Добавлен Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fpdf import FPDF
@@ -20,6 +23,10 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI()
+# ИСПРАВЛЕНИЕ: Убрали default_limits. Теперь лимиты только на конкретных роутах.
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -125,6 +132,7 @@ async def require_admin(user: dict = Depends(get_current_user)):
 
 # === ЭНДПОИНТЫ АВТОРИЗАЦИИ ===
 @app.post("/token")
+@limiter.limit("10/minute")  # Лимит только на логин
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     user = authenticate_user(form_data.username, form_data.password)
     if not user:
@@ -140,6 +148,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/register")
+@limiter.limit("5/minute")  # Лимит только на регистрацию
 async def register_user(form_data: OAuth2PasswordRequestForm = Depends()):
     conn = db()
     if conn.execute("SELECT 1 FROM users WHERE username = ?", (form_data.username,)).fetchone():
@@ -373,4 +382,3 @@ async def get_report(current_user: dict = Depends(get_current_user)):
         media_type="application/pdf",
         headers={"Content-Disposition": "attachment; filename=weekly_report.pdf"}
     )
-
