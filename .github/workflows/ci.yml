@@ -1,4 +1,3 @@
-```yaml
 name: Test and Deploy
 
 on:
@@ -48,4 +47,3 @@ jobs:
           ssh-keygen -y -f "$HOME/.ssh/deploy_key" > /dev/null
           ssh-keyscan -H "$DEPLOY_HOST" >> "$HOME/.ssh/known_hosts"
           ssh -i "$HOME/.ssh/deploy_key" -o IdentitiesOnly=yes -o BatchMode=yes "$DEPLOY_USER@$DEPLOY_HOST" 'sudo /var/www/planner-app/deploy.sh'
-```
