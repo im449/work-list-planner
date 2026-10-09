@@ -1,7 +1,7 @@
 ```yaml
 name: Test and Deploy
 
-on:
+"on":
   push:
     branches:
       - main
@@ -37,7 +37,7 @@ jobs:
   deploy:
     name: Deploy to server
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     steps:
       - name: Deploy via SSH
