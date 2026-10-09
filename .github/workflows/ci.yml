@@ -41,32 +41,32 @@ jobs:
         run: |
           set -eu
 
+          echo "=== 1. Проверяем секреты ==="
+          test -n "$DEPLOY_HOST" || { echo "Ошибка: DEPLOY_HOST не задан"; exit 1; }
+          test -n "$DEPLOY_USER" || { echo "Ошибка: DEPLOY_USER не задан"; exit 1; }
+          test -n "$DEPLOY_SSH_KEY" || { echo "Ошибка: DEPLOY_SSH_KEY не задан"; exit 1; }
+
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
 
           printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/deploy_key"
           chmod 600 "$HOME/.ssh/deploy_key"
 
-          echo "=== 1. Проверяем приватный ключ ==="
-          if ! ssh-keygen -y -P "" -f "$HOME/.ssh/deploy_key" > /dev/null; then
-            echo "ОШИБКА: приватный ключ не читается или защищён паролем."
-            exit 1
-          fi
+          echo "=== 2. Проверяем приватный ключ ==="
+          ssh-keygen -y -P "" -f "$HOME/.ssh/deploy_key" > /dev/null
 
-          echo "=== 2. Проверяем доступность сервера ==="
-          if ! ssh-keyscan -T 10 -p 22422 -H "$DEPLOY_HOST" >> "$HOME/.ssh/known_hosts" 2>&1; then
-            echo "ОШИБКА: сервер недоступен по SSH."
-            exit 1
-          fi
+          echo "=== 3. Проверяем SSH-сервер ==="
+          ssh-keyscan -T 10 -p 22422 -H "$DEPLOY_HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          chmod 600 "$HOME/.ssh/known_hosts"
 
-          echo "=== 3. Подключаемся и запускаем деплой ==="
-          ssh -vv \
+          echo "=== 4. Подключаемся и запускаем деплой ==="
+          ssh \
             -p 22422 \
             -i "$HOME/.ssh/deploy_key" \
             -o IdentitiesOnly=yes \
             -o BatchMode=yes \
             -o ConnectTimeout=15 \
             "$DEPLOY_USER@$DEPLOY_HOST" \
-            'echo "SSH_OK"; sudo -n /var/www/planner-app/deploy.sh'
+            'echo "SSH_OK"; set -x; sudo -n /var/www/planner-app/deploy.sh'
 
-          echo "=== Деплой завершён ==="
+          echo "=== Деплой успешно завершён ==="
