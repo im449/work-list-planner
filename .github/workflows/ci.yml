@@ -61,6 +61,7 @@ jobs:
 
           echo "=== 3. Подключаемся и запускаем деплой ==="
           ssh -vv \
+            -p 22422 \
             -i "$HOME/.ssh/deploy_key" \
             -o IdentitiesOnly=yes \
             -o BatchMode=yes \
