@@ -1,4 +1,3 @@
-```yaml
 name: Test and Deploy
 
 "on":
@@ -56,4 +55,3 @@ jobs:
             -o IdentitiesOnly=yes \
             "$DEPLOY_USER@$DEPLOY_HOST" \
             'sudo /var/www/planner-app/deploy.sh'
-```
