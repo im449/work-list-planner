@@ -1,3 +1,4 @@
+```yaml
 name: Test and Deploy
 
 "on":
@@ -12,6 +13,7 @@ jobs:
   test:
     name: Run tests
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -38,6 +40,7 @@ jobs:
     needs: test
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
+
     steps:
       - name: Deploy via SSH
         env:
@@ -45,13 +48,46 @@ jobs:
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
         run: |
-          set -e
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
-          ssh -i ~/.ssh/deploy_key \
+          set -eu
+
+          echo "Checking deployment settings"
+          if [ -z "$DEPLOY_HOST" ]; then
+            echo "ERROR: DEPLOY_HOST secret is empty or missing"
+            exit 1
+          fi
+          if [ -z "$DEPLOY_USER" ]; then
+            echo "ERROR: DEPLOY_USER secret is empty or missing"
+            exit 1
+          fi
+          if [ -z "$DEPLOY_SSH_KEY" ]; then
+            echo "ERROR: DEPLOY_SSH_KEY secret is empty or missing"
+            exit 1
+          fi
+
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+
+          echo "Checking SSH key format"
+          if ! ssh-keygen -y -f "$HOME/.ssh/deploy_key" > /dev/null; then
+            echo "ERROR: SSH private key is invalid or has an unsupported format"
+            exit 1
+          fi
+
+          echo "Checking server connection"
+          if ! ssh-keyscan -T 10 -H "$DEPLOY_HOST" >> "$HOME/.ssh/known_hosts"; then
+            echo "ERROR: Cannot reach SSH server at DEPLOY_HOST"
+            exit 1
+          fi
+
+          echo "Connecting to deployment server"
+          ssh -v \
+            -i "$HOME/.ssh/deploy_key" \
             -o IdentitiesOnly=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
             "$DEPLOY_USER@$DEPLOY_HOST" \
             'sudo /var/www/planner-app/deploy.sh'
+```
