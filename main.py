@@ -1,3 +1,5 @@
+from pydantic import BaseModel, Field
+from typing import Optional
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -7,8 +9,9 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fpdf import FPDF
 import os
 import sqlite3
+from dotenv import load_dotenv
+load_dotenv()
 from datetime import datetime, timedelta
-from typing import Optional
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 
@@ -24,7 +27,6 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI()
 
-# ИСПРАВЛЕНИЕ: Убрали default_limits. Теперь лимиты только на конкретных роутах.
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -67,22 +69,32 @@ def init_db():
             role TEXT DEFAULT 'user'
         )
     """)
-    # Миграция существующей схемы
+
     user_cols = [r["name"] for r in c.execute("PRAGMA table_info(users)")]
     if "role" not in user_cols:
         c.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'")
-    
+
     task_cols = [r["name"] for r in c.execute("PRAGMA table_info(tasks)")]
     if "user_id" not in task_cols:
         c.execute("ALTER TABLE tasks ADD COLUMN user_id INTEGER")
-        # Первый зарегистрированный пользователь становится админом
-        # и забирает все существующие задачи себе
         c.execute("UPDATE users SET role='admin' WHERE id = (SELECT MIN(id) FROM users)")
         c.execute("UPDATE tasks SET user_id = (SELECT MIN(id) FROM users) WHERE user_id IS NULL")
-    
+
     if "archived" not in task_cols:
         c.execute("ALTER TABLE tasks ADD COLUMN archived INTEGER DEFAULT 0")
-    
+
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS savings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            day INTEGER NOT NULL,
+            amount REAL NOT NULL DEFAULT 0,
+            paid INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(user_id, day)
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -124,6 +136,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
             raise credentials_exception
     except JWTError:
         raise credentials_exception
+
     conn = db()
     row = conn.execute("SELECT id, username, role FROM users WHERE username = ?", (username,)).fetchone()
     conn.close()
@@ -138,9 +151,8 @@ async def require_admin(user: dict = Depends(get_current_user)):
 
 # === ЭНДПОИНТЫ АВТОРИЗАЦИИ ===
 @app.post("/token")
-@limiter.limit("10/minute")  # Лимит только на логин
+@limiter.limit("10/minute")
 async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
-    # request добавлен первым аргументом для корректной работы slowapi
     user = authenticate_user(form_data.username, form_data.password)
     if not user:
         raise HTTPException(
@@ -157,7 +169,6 @@ async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends
 @app.post("/register")
 @limiter.limit("5/minute")
 async def register_user(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
-    # request добавлен первым аргументом
     conn = db()
     if conn.execute("SELECT 1 FROM users WHERE username = ?", (form_data.username,)).fetchone():
         conn.close()
@@ -168,6 +179,14 @@ async def register_user(request: Request, form_data: OAuth2PasswordRequestForm =
     conn.close()
     return {"status": "ok", "username": form_data.username}
 
+# === МОДЕЛЬ ДЛЯ ОБНОВЛЕНИЯ ЗАДАЧИ ===
+class TaskUpdate(BaseModel):
+    title: Optional[str] = None
+    due_date: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+    archived: Optional[bool] = None
+
 # === ОСНОВНЫЕ ЭНДПОИНТЫ ===
 @app.get("/")
 async def root():
@@ -175,6 +194,14 @@ async def root():
     with open(file_path, "r", encoding="utf-8") as f:
         html_content = f.read()
     return Response(content=html_content, media_type="text/html")
+
+@app.get("/savings.html")
+async def savings_page():
+    file_path = os.path.join(os.path.dirname(__file__), "savings.html")
+    with open(file_path, "r", encoding="utf-8") as f:
+        html_content = f.read()
+    return Response(content=html_content, media_type="text/html")
+
 
 @app.get("/tasks")
 async def get_tasks(archived: bool = False, current_user: dict = Depends(get_current_user)):
@@ -210,21 +237,48 @@ async def create_task(task: dict, current_user: dict = Depends(get_current_user)
     return {"id": task_id, "status": "ok"}
 
 @app.put("/tasks/{task_id}")
-async def update_task(task_id: int, task: dict, current_user: dict = Depends(get_current_user)):
+async def update_task(
+    task_id: int,
+    data: TaskUpdate,
+    current_user: dict = Depends(get_current_user)
+):
     conn = db()
     row = conn.execute(
-        "SELECT status, description FROM tasks WHERE id = ? AND user_id = ?",
+        "SELECT * FROM tasks WHERE id = ? AND user_id = ?",
         (task_id, current_user["id"])
     ).fetchone()
     if not row:
         conn.close()
         raise HTTPException(status_code=404, detail="Task not found")
-    new_status = task.get("status") or row["status"]
-    new_desc = task.get("description") if task.get("description") is not None else row["description"]
-    conn.execute(
-        "UPDATE tasks SET status = ?, description = ? WHERE id = ? AND user_id = ?",
-        (new_status, new_desc, task_id, current_user["id"])
-    )
+
+    updates = []
+    values = []
+
+    if data.title is not None:
+        updates.append("title = ?")
+        values.append(data.title)
+    if data.due_date is not None:
+        updates.append("due_date = ?")
+        values.append(data.due_date)
+    if data.description is not None:
+        updates.append("description = ?")
+        values.append(data.description)
+    if data.status is not None:
+        if data.status not in ["todo", "progress", "done"]:
+            raise HTTPException(status_code=400, detail="Invalid status")
+        updates.append("status = ?")
+        values.append(data.status)
+    if data.archived is not None:
+        updates.append("archived = ?")
+        values.append(1 if data.archived else 0)
+
+    if not updates:
+        conn.close()
+        return {"status": "ok", "message": "No fields updated"}
+
+    values.append(task_id)
+    query = f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?"
+    conn.execute(query, values)
     conn.commit()
     conn.close()
     return {"status": "ok"}
@@ -240,7 +294,6 @@ async def delete_task(task_id: int, current_user: dict = Depends(get_current_use
 # === АРХИВ ===
 @app.post("/tasks/archive-done")
 async def archive_done_tasks(current_user: dict = Depends(get_current_user)):
-    """Убрать в архив все выполненные задачи пользователя"""
     conn = db()
     cur = conn.execute(
         "UPDATE tasks SET archived = 1 WHERE user_id = ? AND status = 'done' AND archived = 0",
@@ -313,80 +366,195 @@ async def admin_delete_user(user_id: int, admin: dict = Depends(require_admin)):
     conn.close()
     return {"status": "ok"}
 
+
 @app.get("/admin")
 async def admin_page():
     file_path = os.path.join(os.path.dirname(__file__), "admin.html")
     with open(file_path, "r", encoding="utf-8") as f:
         return Response(content=f.read(), media_type="text/html")
 
-# === PDF ОТЧЁТ ===
+# === PDF ОТЧЁТ С КИРИЛЛИЦЕЙ ===
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FONT_PATH = os.path.join(BASE_DIR, "DejaVuSans.ttf")
+
 class PDFWithCyrillic(FPDF):
     def __init__(self):
-        super().__init__()
-        base_path = "/usr/share/fonts/truetype/dejavu"
-        self.add_font("DejaVu", "", os.path.join(base_path, "DejaVuSans.ttf"), uni=True)
-        self.add_font("DejaVu", "B", os.path.join(base_path, "DejaVuSans-Bold.ttf"), uni=True)
+        super().__init__(orientation="L", unit="mm", format="A4")
+        if os.path.exists(FONT_PATH):
+            self.add_font("DejaVuSans", "", FONT_PATH, uni=True)
+            self.add_font("DejaVuSans", "B", FONT_PATH, uni=True)
+            self.add_font("DejaVuSans", "I", FONT_PATH, uni=True)
+            self.set_font("DejaVuSans", size=12)
+        else:
+            self.set_font("Arial", size=12)
 
-def _get_status(t):
-    return t["status"] if isinstance(t, dict) else t.status
+    def header(self):
+        font = "DejaVuSans" if os.path.exists(FONT_PATH) else "Arial"
+        self.set_font(font, "B", 14)
+        self.cell(0, 10, "Отчёт по задачам", ln=True, align="C")
 
-def _get_title(t):
-    return t["title"] if isinstance(t, dict) else t.title
+    def footer(self):
+        self.set_y(-15)
+        font = "DejaVuSans" if os.path.exists(FONT_PATH) else "Arial"
+        self.set_font(font, "I", 8)
+        self.cell(0, 10, f"Страница {self.page_no()}", align="C")
 
-def generate_report_pdf(tasks):
-    pdf = PDFWithCyrillic()
-    pdf.add_page()
-    pdf.set_font("DejaVu", size=14)
-    pdf.cell(0, 10, txt="Work Report", ln=True, align="C")
-    pdf.set_font("DejaVu", size=10)
-    period = datetime.now().strftime("%d.%m.%Y")
-    pdf.cell(0, 8, txt=f"Period: {period}", ln=True, align="C")
-    pdf.ln(10)
-    col_w = pdf.w / 3 - 10
-    pdf.set_fill_color(240, 240, 240)
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font("DejaVu", "B", size=10)
-    pdf.cell(col_w, 8, "TODO", border=1, align="C", fill=True, ln=0)
-    pdf.cell(col_w, 8, "IN PROGRESS", border=1, align="C", fill=True, ln=0)
-    pdf.cell(col_w, 8, "DONE", border=1, align="C", fill=True, ln=1)
-    todo = [t for t in tasks if _get_status(t) == "todo"]
-    progress = [t for t in tasks if _get_status(t) == "progress"]
-    done = [t for t in tasks if _get_status(t) == "done"]
-    max_rows = max(len(todo), len(progress), len(done))
-    pdf.set_font("DejaVu", size=9)
-    for i in range(max_rows):
-        cells = [
-            _get_title(todo[i]) if i < len(todo) else "",
-            _get_title(progress[i]) if i < len(progress) else "",
-            _get_title(done[i]) if i < len(done) else "",
-        ]
-        for text in cells:
-            display = (text[:40] + "...") if text and len(text) > 40 else (text or "")
-            pdf.cell(col_w, 6, txt=display, border=1, ln=0, align="L")
-        pdf.ln()
-    return pdf.output(dest="S")
 
-@app.get("/report")
-async def get_report(current_user: dict = Depends(get_current_user)):
+@app.post("/tasks/report")
+async def generate_report(request: Request, current_user: dict = Depends(get_current_user)):
     conn = db()
-    rows = conn.execute(
-        "SELECT id, title, due_date, status, description FROM tasks WHERE user_id = ? AND archived = 0 ORDER BY id",
-        (current_user["id"],),
-    ).fetchall()
-    conn.close()
-    tasks = [{
-        "id": r["id"],
-        "title": r["title"],
-        "dueDate": r["due_date"] or "",
-        "status": r["status"],
-        "description": r["description"] or ""
-    } for r in rows]
     try:
-        pdf_bytes = generate_report_pdf(tasks).encode("latin-1")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="PDF generation failed: " + str(e))
+        rows = conn.execute(
+            "SELECT id, title, due_date, status, description "
+            "FROM tasks WHERE user_id = ? AND archived = 0 ORDER BY id DESC",
+            (current_user["id"],)
+        ).fetchall()
+    finally:
+        conn.close()
+
+    pdf = PDFWithCyrillic()
+    font = "DejaVuSans" if os.path.exists(FONT_PATH) else "Arial"
+    pdf.set_margins(10, 10, 10)
+    pdf.set_auto_page_break(auto=False)
+    pdf.add_page()
+
+    col_widths = [12, 72, 28, 30, 135]
+    headers = ["ID", "Название", "Дата", "Статус", "Описание"]
+    line_h = 5
+    bottom_limit = 190
+
+    def draw_table_header():
+        pdf.set_font(font, "B", 8)
+        pdf.set_x(10)
+        for width, label in zip(col_widths, headers):
+            pdf.cell(width, 8, label, border=1, align="C")
+        pdf.ln(8)
+
+    def clean(value):
+        return str(value or "").replace("\r", " ").replace("\n", " ")
+
+    def draw_row(row):
+        values = [
+            str(row["id"]),
+            clean(row["title"]),
+            clean(row["due_date"]),
+            clean(row["status"]),
+            clean(row["description"]),
+        ]
+
+        pdf.set_font(font, "", 8)
+        line_counts = []
+        for width, value in zip(col_widths, values):
+            lines = pdf.multi_cell(width, line_h, value or " ", split_only=True)
+            line_counts.append(max(1, len(lines)))
+
+        row_height = max(line_counts) * line_h
+
+        if pdf.get_y() + row_height > bottom_limit:
+            pdf.add_page()
+            draw_table_header()
+
+        x = 10
+        y = pdf.get_y()
+        for width, value in zip(col_widths, values):
+            pdf.set_xy(x, y)
+            pdf.multi_cell(width, line_h, value or " ", border=1)
+            x += width
+
+        pdf.set_xy(10, y + row_height)
+
+    draw_table_header()
+
+    if not rows:
+        pdf.set_font(font, "", 9)
+        pdf.cell(sum(col_widths), 10, "Нет задач для отображения", border=1)
+        pdf.ln(10)
+    else:
+        for row in rows:
+            draw_row(row)
+
+    pdf_data = pdf.output(dest="S")
+    if isinstance(pdf_data, str):
+        pdf_data = pdf_data.encode("latin-1")
+
     return Response(
-        content=pdf_bytes,
+        content=pdf_data,
         media_type="application/pdf",
-        headers={"Content-Disposition": "attachment; filename=weekly_report.pdf"}
+        headers={"Content-Disposition": "attachment; filename=tasks_report.pdf"}
     )
+
+
+
+
+
+# === НАКОПЛЕНИЯ ===
+@app.get("/api/savings")
+async def get_savings(current_user: dict = Depends(get_current_user)):
+    conn = db()
+    try:
+        rows = conn.execute(
+            "SELECT day, amount, paid FROM savings WHERE user_id = ? ORDER BY day",
+            (current_user["id"],)
+        ).fetchall()
+
+        saved = {
+            row["day"]: {
+                "day": row["day"],
+                "amount": row["amount"],
+                "paid": bool(row["paid"])
+            }
+            for row in rows
+        }
+
+        return [
+            saved.get(day, {"day": day, "amount": 0, "paid": False})
+            for day in range(1, 366)
+        ]
+    finally:
+        conn.close()
+
+
+@app.put("/api/savings/{day}")
+async def update_saving(
+    day: int,
+    item: dict,
+    current_user: dict = Depends(get_current_user)
+):
+    if day < 1 or day > 365:
+        raise HTTPException(status_code=400, detail="День должен быть от 1 до 365")
+
+    try:
+        amount = float(item.get("amount", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Некорректная сумма")
+
+    if amount < 0:
+        raise HTTPException(status_code=400, detail="Сумма не может быть отрицательной")
+
+    paid = 1 if item.get("paid", False) else 0
+
+    conn = db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO savings (user_id, day, amount, paid)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, day)
+            DO UPDATE SET amount = excluded.amount, paid = excluded.paid
+            """,
+            (current_user["id"], day, amount, paid)
+        )
+        conn.commit()
+        return {"day": day, "amount": amount, "paid": bool(paid)}
+    finally:
+        conn.close()
+
+
+# === ЗДОРОВЬЕ И ПРОВЕРКА ===
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "planner"}
+
+@app.get("/version")
+async def version():
+    return {"version": "1.0.0", "build": "2026-10-09"}

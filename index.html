@@ -73,13 +73,14 @@
     </div>
   </div>
 
-  <div class="top-bar">
-    <h1>Планировщик задач</h1>
-    <div class="user-info">
-      <span id="current-user"></span>
-      <button class="btn-logout" onclick="logout()">Выйти</button>
-    </div>
+<div class="top-bar">
+  <h1>Планировщик задач</h1>
+  <div class="user-info">
+    <a href="/savings.html" style="color:#2563EB; text-decoration:none; margin-right:16px; font-weight:600;">💵 Накопления</a>
+    <span id="current-user"></span>
+    <button class="btn-logout" onclick="logout()">Выйти</button>
   </div>
+</div>
 
   <div class="layout">
     <div class="sidebar">
@@ -334,7 +335,7 @@ async function downloadPDF() {
     return;
   }
   try {
-    const res = await fetch('/report', { headers: getAuthHeaders() });
+    const res = await fetch('/tasks/report', { method: 'POST', headers: getAuthHeaders() });
     if (res.status === 401) {
       localStorage.removeItem('auth_token');
       showLoginScreen();

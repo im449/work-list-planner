@@ -23,3 +23,11 @@ __pycache__/
 .DS_Store
 *.save
 .env
+
+# Локальные резервные копии
+main.py.before_*
+main.py.broken_backup_*
+savings.html.backup_*
+
+# Кэш шрифтов PDF
+*.pkl

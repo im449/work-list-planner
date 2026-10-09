@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Календарь накоплений</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; background: #f0f2f5; padding: 12px; }
+
+    #login-screen { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: none; justify-content: center; align-items: center; z-index: 999; }
+    .auth-box { background: white; padding: 24px; border-radius: 8px; width: 320px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); text-align: center; }
+    .auth-box h2 { margin-bottom: 16px; color: #333; }
+    .auth-box input { width: 100%; padding: 8px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 4px; }
+    .auth-box button { padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; width: 100%; }
+    .error { color: #dc3545; margin-top: 8px; font-size: 13px; display: none; }
+
+    .top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    h1 { color: #333; }
+    .user-info { font-size: 13px; color: #666; }
+    .btn-logout { padding: 4px 12px; background: #6c757d; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
+
+    .stats-block { background: white; padding: 16px; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.1); margin-bottom: 16px; }
+    .progress-bar-bg { width: 100%; background: #e5e7eb; height: 20px; border-radius: 10px; overflow: hidden; margin-top: 10px; }
+    .progress-bar-fill { height: 100%; background: #2563EB; border-radius: 10px; width: 0%; transition: width 0.4s; }
+
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(40px, 1fr)); gap: 8px; max-width: 1000px; margin: 0 auto; }
+    .cell { width: 40px; height: 40px; background: #fff; border: 1px solid #ddd; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #555; }
+    .cell.paid { background: #10b981; border-color: #10b981; color: #fff; }
+  </style>
+</head>
+<body>
+
+  <!-- Экран входа (тот же, что и в index.html) -->
+  <div id="login-screen">
+    <div class="auth-box">
+      <h2 id="auth-title">Вход</h2>
+      <input id="auth-username" placeholder="Логин">
+      <input id="auth-password" type="password" placeholder="Пароль">
+      <button id="auth-btn" onclick="handleAuth()">Войти</button>
+      <div id="auth-error" class="error"></div>
+      <div class="switch-mode" onclick="toggleMode()">Регистрация</div>
+    </div>
+  </div>
+
+  <div class="top-bar">
+    <h1>Календарь накоплений</h1>
+    <div class="user-info">
+      <a href="/" style="margin-right:12px;">← Назад к задачам</a>
+      <span id="current-user"></span>
+      <button class="btn-logout" onclick="logout()">Выйти</button>
+    </div>
+  </div>
+
+  <div class="stats-block">
+    <h3>Прогресс накоплений</h3>
+    <p>Цель: накопить 100 000 ₽ за год</p>
+    <div style="margin: 10px 0;">
+      Накоплено: <b id="total-sum">0 ₽</b> | Дней оплачено: <b id="days-paid">0</b>/365
+    </div>
+    <div class="progress-bar-bg">
+      <div class="progress-bar-fill" id="progress-fill"></div>
+    </div>
+  </div>
+
+  <div class="grid" id="cells-grid">
+    <!-- Сюда JS будет вставлять 365 ячеек -->
+  </div>
+
+<script>
+// --- Тот же код авторизации, что и в index.html ---
+function escapeHtml(t){if(!t)return'';return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');}
+
+let isRegisterMode = false;
+
+function toggleMode() {
+  isRegisterMode = !isRegisterMode;
+  const title = document.getElementById('auth-title');
+  const btn = document.getElementById('auth-btn');
+  const switchText = document.querySelector('.switch-mode');
+  if (isRegisterMode) {
+    title.innerText = 'Регистрация';
+    btn.innerText = 'Зарегистрироваться';
+    switchText.innerText = 'Уже есть аккаунт? Войти';
+  } else {
+    title.innerText = 'Вход';
+    btn.innerText = 'Войти';
+    switchText.innerText = 'Регистрация';
+  }
+  document.getElementById('auth-error').style.display = 'none';
+}
+
+function showLoginScreen() { document.getElementById('login-screen').style.display = 'flex'; }
+function hideLoginScreen() { document.getElementById('login-screen').style.display = 'none'; }
+
+async function handleAuth() {
+  const username = document.getElementById('auth-username').value.trim();
+  const password = document.getElementById('auth-password').value;
+  const errorEl = document.getElementById('auth-error');
+  errorEl.style.display = 'none';
+
+  if (!username || !password) {
+    errorEl.innerText = 'Заполните логин и пароль';
+    errorEl.style.display = 'block';
+    return;
+  }
+
+  const url = isRegisterMode ? '/register' : '/token';
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body: 'username=' + encodeURIComponent(username) + '&password=' + encodeURIComponent(password)
+    });
+
+    if (!res.ok) {
+      let msg = 'Ошибка сервера';
+      try { const errData = await res.json(); msg = errData.detail || msg; } catch(e) {}
+      throw new Error(msg);
+    }
+
+    const data = await res.json();
+
+    if (isRegisterMode) {
+      alert('Пользователь создан. Теперь войдите.');
+      toggleMode();
+    } else {
+      localStorage.setItem('auth_token', data.access_token);
+      localStorage.setItem('username', username);
+      document.getElementById('current-user').innerText = 'Вы: ' + username;
+      hideLoginScreen();
+      loadSavings();
+    }
+  } catch (err) {
+    errorEl.innerText = err.message || 'Ошибка авторизации';
+    errorEl.style.display = 'block';
+  }
+}
+
+function logout() {
+  localStorage.removeItem('auth_token');
+  localStorage.removeItem('username');
+  document.getElementById('current-user').innerText = '';
+  showLoginScreen();
+}
+
+function getAuthHeaders() {
+  const token = localStorage.getItem('auth_token');
+  return {
+    'Content-Type': 'application/json',
+    'Authorization': 'Bearer ' + (token || '')
+  };
+}
+
+// --- Логика страницы накоплений ---
+async function loadSavings() {
+  try {
+    const res = await fetch('/api/savings', { headers: getAuthHeaders() });
+
+    if (res.status === 401) {
+      localStorage.removeItem('auth_token');
+      showLoginScreen();
+      return;
+    }
+    if (!res.ok) throw new Error('Ошибка загрузки накоплений');
+
+    const items = await res.json();
+    const paidItems = items.filter(i => i.paid);
+    const totalSum = paidItems.reduce((acc, i) => acc + (Number(i.amount) || 0), 0);
+    const daysPaid = paidItems.length;
+
+    document.getElementById('total-sum').innerText =
+      totalSum.toLocaleString('ru-RU') + ' ₽';
+    document.getElementById('days-paid').innerText = daysPaid;
+    document.getElementById('progress-fill').style.width =
+      Math.min((daysPaid / 365) * 100, 100) + '%';
+
+    const grid = document.getElementById('cells-grid');
+    grid.innerHTML = '';
+
+    for (let d = 1; d <= 365; d++) {
+      const item = items.find(i => Number(i.day) === d);
+      const cell = document.createElement('div');
+
+      cell.className = 'cell' + (item && item.paid ? ' paid' : '');
+      cell.innerText = d;
+      cell.title = item && item.paid
+        ? `День ${d}: ${item.amount} ₽. Нажмите, чтобы изменить или отменить.`
+        : `День ${d}: нажмите, чтобы добавить накопление`;
+      cell.style.cursor = 'pointer';
+      cell.setAttribute('role', 'button');
+      cell.setAttribute('tabindex', '0');
+
+      const editDay = async () => {
+        const current = item && item.paid ? Number(item.amount) || 0 : '';
+        const answer = prompt(
+          `День ${d}. Введите сумму накопления в рублях.\n` +
+          'Чтобы отменить отметку дня, введите 0.',
+          current
+        );
+        if (answer === null) return;
+
+        const amount = Number(answer.trim().replace(',', '.'));
+        if (!Number.isFinite(amount) || amount < 0) {
+          alert('Введите корректную неотрицательную сумму.');
+          return;
+        }
+
+        try {
+          const saveRes = await fetch(`/api/savings/${d}`, {
+            method: 'PUT',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({ amount: amount, paid: amount > 0 })
+          });
+
+          if (saveRes.status === 401) {
+            localStorage.removeItem('auth_token');
+            showLoginScreen();
+            return;
+          }
+          if (!saveRes.ok) {
+            const detail = await saveRes.text();
+            throw new Error(detail || 'Не удалось сохранить');
+          }
+
+          await loadSavings();
+        } catch (e) {
+          alert('Ошибка сохранения: ' + e.message);
+        }
+      };
+
+      cell.addEventListener('click', editDay);
+      cell.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          editDay();
+        }
+      });
+
+      grid.appendChild(cell);
+    }
+  } catch (err) {
+    console.error(err);
+    alert('Ошибка: ' + err.message);
+  }
+}
+
+// --- Старт страницы ---
+const savedToken = localStorage.getItem('auth_token');
+const savedUsername = localStorage.getItem('username');
+
+if (savedToken) {
+  if (savedUsername) {
+    document.getElementById('current-user').innerText = 'Вы: ' + savedUsername;
+  }
+  hideLoginScreen();
+  loadSavings();
+} else {
+  showLoginScreen();
+}
+</script>
+</body>
+</html>
