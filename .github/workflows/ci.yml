@@ -3,15 +3,16 @@ name: Test and Deploy
 
 on:
   push:
-    branches: ["main"]
+    branches:
+      - main
   pull_request:
-    branches: ["main"]
+    branches:
+      - main
 
 jobs:
   test:
     name: Run tests
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -29,7 +30,7 @@ jobs:
 
       - name: Run tests
         env:
-          SECRET_KEY: "test-secret-key"
+          SECRET_KEY: test-secret-key
           DB_PATH: ":memory:"
         run: pytest tests/ -v
 
@@ -38,7 +39,6 @@ jobs:
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-
     steps:
       - name: Deploy via SSH
         env:
