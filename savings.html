@@ -2,7 +2,7 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
-  <title>Календарь накоплений</title>
+  <title>Моя копилка</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: Arial, sans-serif; background: #f0f2f5; padding: 12px; }
@@ -23,9 +23,15 @@
     .progress-bar-bg { width: 100%; background: #e5e7eb; height: 20px; border-radius: 10px; overflow: hidden; margin-top: 10px; }
     .progress-bar-fill { height: 100%; background: #2563EB; border-radius: 10px; width: 0%; transition: width 0.4s; }
 
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(40px, 1fr)); gap: 8px; max-width: 1000px; margin: 0 auto; }
-    .cell { width: 40px; height: 40px; background: #fff; border: 1px solid #ddd; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #555; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(76px, 1fr)); gap: 8px; max-width: 1000px; margin: 0 auto; }
+    .cell { position: relative; min-width: 0; min-height: 64px; background: #fff; border: 1px solid #ddd; border-radius: 6px; overflow: hidden; color: #555; }
     .cell.paid { background: #10b981; border-color: #10b981; color: #fff; }
+    .cell-main { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; width: 100%; min-height: 64px; padding: 8px 2px 4px; border: 0; background: transparent; color: inherit; cursor: pointer; }
+    .cell-day { font-size: 12px; }
+    .cell-amount { font-size: 10px; font-weight: 700; }
+    .cell-edit { position: absolute; top: 2px; right: 2px; width: 19px; height: 19px; padding: 0; border: 0; border-radius: 4px; background: rgba(0,0,0,0.06); color: inherit; cursor: pointer; font-size: 12px; line-height: 19px; }
+    .cell.paid .cell-edit { background: rgba(255,255,255,0.22); }
+    .cell-main:focus-visible, .cell-edit:focus-visible { outline: 2px solid #2563EB; outline-offset: -2px; }
   </style>
 </head>
 <body>
@@ -43,7 +49,7 @@
   </div>
 
   <div class="top-bar">
-    <h1>Календарь накоплений</h1>
+    <h1>Моя копилка</h1>
     <div class="user-info">
       <a href="/" style="margin-right:12px;">← Назад к задачам</a>
       <span id="current-user"></span>
@@ -52,14 +58,34 @@
   </div>
 
   <div class="stats-block">
-    <h3>Прогресс накоплений</h3>
-    <p>Цель: накопить 100 000 ₽ за год</p>
-    <div style="margin: 10px 0;">
-      Накоплено: <b id="total-sum">0 ₽</b> | Дней оплачено: <b id="days-paid">0</b>/365
+    <h3>Моя цель накоплений</h3>
+    <div style="display:flex; gap:12px; flex-wrap:wrap; margin:12px 0;">
+      <label>Цель, ₽
+        <input id="goal-input" type="number" min="1" step="0.01" value="100000"
+          style="display:block; width:180px; padding:8px; margin-top:4px;">
+      </label>
+      <label>Срок, дней
+        <input id="days-input" type="number" min="1" max="3650" step="1" value="365"
+          style="display:block; width:140px; padding:8px; margin-top:4px;">
+      </label>
+      <button id="settings-save" type="button"
+        style="align-self:end; padding:9px 14px; cursor:pointer;">Сохранить цель</button>
     </div>
+    <div style="margin:10px 0;">
+      Накоплено: <b id="total-sum">0 ₽</b> |
+      Осталось: <b id="remaining-sum">100 000 ₽</b>
+    </div>
+    <div style="margin:10px 0;">
+      Отмечено дней: <b id="days-paid">0</b>/<span id="days-total">365</span> |
+      Выполнено цели: <b id="progress-percent">0%</b>
+    </div>
+    <p id="daily-plan">План рассчитывается...</p>
     <div class="progress-bar-bg">
       <div class="progress-bar-fill" id="progress-fill"></div>
     </div>
+    <p style="margin-top:10px;font-size:13px;color:#666;">
+      Нажмите на день и укажите фактическую сумму взноса. Рекомендация пересчитывается автоматически.
+    </p>
   </div>
 
   <div class="grid" id="cells-grid">
@@ -153,97 +179,177 @@ function getAuthHeaders() {
 }
 
 // --- Логика страницы накоплений ---
+let SAVINGS_GOAL = 100000;
+let SAVINGS_DAYS = 365;
+
+function formatMoney(value) {
+  return Number(value || 0).toLocaleString('ru-RU', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2
+  }) + ' ₽';
+}
+
+async function apiJson(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: { ...getAuthHeaders(), ...(options.headers || {}) }
+  });
+
+  if (response.status === 401) {
+    localStorage.removeItem('auth_token');
+    showLoginScreen();
+    throw new Error('Сессия завершена. Войдите в приложение снова.');
+  }
+
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(detail || `Ошибка HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
+
+async function saveSaving(day, amount, paid) {
+  await apiJson(`/api/savings/${day}`, {
+    method: 'PUT',
+    body: JSON.stringify({ amount, paid })
+  });
+  await loadSavings();
+}
+
+async function saveSavingsSettings() {
+  const goal = Number(document.getElementById('goal-input').value);
+  const days = Number(document.getElementById('days-input').value);
+
+  if (!Number.isFinite(goal) || goal <= 0) {
+    alert('Укажите цель больше нуля.');
+    return;
+  }
+  if (!Number.isInteger(days) || days < 1 || days > 3650) {
+    alert('Укажите срок от 1 до 3650 дней.');
+    return;
+  }
+
+  try {
+    await apiJson('/api/savings/settings', {
+      method: 'PUT',
+      body: JSON.stringify({ goal, days })
+    });
+    await loadSavings();
+  } catch (error) {
+    alert('Не удалось сохранить настройки: ' + error.message);
+  }
+}
+
 async function loadSavings() {
   try {
-    const res = await fetch('/api/savings', { headers: getAuthHeaders() });
+    const settings = await apiJson('/api/savings/settings');
+    SAVINGS_GOAL = Number(settings.goal) || 100000;
+    SAVINGS_DAYS = Number(settings.days) || 365;
 
-    if (res.status === 401) {
-      localStorage.removeItem('auth_token');
-      showLoginScreen();
-      return;
+    document.getElementById('goal-input').value = SAVINGS_GOAL;
+    document.getElementById('days-input').value = SAVINGS_DAYS;
+    document.getElementById('days-total').innerText = SAVINGS_DAYS;
+
+    const items = await apiJson('/api/savings');
+    const paidItems = items.filter(item => item.paid);
+    const totalSum = Math.round(
+      paidItems.reduce((sum, item) => sum + (Number(item.amount) || 0), 0) * 100
+    ) / 100;
+    const remaining = Math.max(0, Math.round((SAVINGS_GOAL - totalSum) * 100) / 100);
+    const unpaidItems = items.filter(item => !item.paid);
+
+    const remainingCents = Math.max(0, Math.round(remaining * 100));
+    const baseCents = unpaidItems.length
+      ? Math.floor(remainingCents / unpaidItems.length) : 0;
+    const extraCents = unpaidItems.length
+      ? remainingCents % unpaidItems.length : 0;
+
+    const plannedByDay = new Map();
+    unpaidItems.forEach((item, index) => {
+      plannedByDay.set(Number(item.day),
+        (baseCents + (index < extraCents ? 1 : 0)) / 100);
+    });
+
+    const percent = Math.min((totalSum / SAVINGS_GOAL) * 100, 100);
+    document.getElementById('total-sum').innerText = formatMoney(totalSum);
+    document.getElementById('remaining-sum').innerText = formatMoney(remaining);
+    document.getElementById('days-paid').innerText = paidItems.length;
+    document.getElementById('progress-percent').innerText =
+      percent.toLocaleString('ru-RU', { maximumFractionDigits: 1 }) + '%';
+    document.getElementById('progress-fill').style.width = percent + '%';
+
+    if (remaining <= 0) {
+      document.getElementById('daily-plan').innerText =
+        'Цель достигнута! Новые взносы не требуются.';
+    } else if (unpaidItems.length) {
+      document.getElementById('daily-plan').innerText =
+        'Рекомендованный взнос на каждый невыполненный день: ' +
+        formatMoney(plannedByDay.get(Number(unpaidItems[0].day)) || 0) +
+        '. Пересчитывается после каждого взноса.';
+    } else {
+      document.getElementById('daily-plan').innerText =
+        'Все дни отмечены, но цель ещё не достигнута. Увеличьте срок или измените цель.';
     }
-    if (!res.ok) throw new Error('Ошибка загрузки накоплений');
 
-    const items = await res.json();
-    const paidItems = items.filter(i => i.paid);
-    const totalSum = paidItems.reduce((acc, i) => acc + (Number(i.amount) || 0), 0);
-    const daysPaid = paidItems.length;
-
-    document.getElementById('total-sum').innerText =
-      totalSum.toLocaleString('ru-RU') + ' ₽';
-    document.getElementById('days-paid').innerText = daysPaid;
-    document.getElementById('progress-fill').style.width =
-      Math.min((daysPaid / 365) * 100, 100) + '%';
-
+    const byDay = new Map(items.map(item => [Number(item.day), item]));
     const grid = document.getElementById('cells-grid');
     grid.innerHTML = '';
 
-    for (let d = 1; d <= 365; d++) {
-      const item = items.find(i => Number(i.day) === d);
+    for (let d = 1; d <= SAVINGS_DAYS; d++) {
+      const item = byDay.get(d) || { day: d, amount: 0, paid: false };
       const cell = document.createElement('div');
+      cell.className = 'cell' + (item.paid ? ' paid' : '');
 
-      cell.className = 'cell' + (item && item.paid ? ' paid' : '');
-      cell.innerText = d;
-      cell.title = item && item.paid
-        ? `День ${d}: ${item.amount} ₽. Нажмите, чтобы изменить или отменить.`
-        : `День ${d}: нажмите, чтобы добавить накопление`;
-      cell.style.cursor = 'pointer';
-      cell.setAttribute('role', 'button');
-      cell.setAttribute('tabindex', '0');
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'cell-main';
+      button.title = `День ${d}. Нажмите, чтобы ввести фактический взнос.`;
 
-      const editDay = async () => {
-        const current = item && item.paid ? Number(item.amount) || 0 : '';
+      const dayLabel = document.createElement('span');
+      dayLabel.className = 'cell-day';
+      dayLabel.innerText = `День ${d}`;
+
+      const amountLabel = document.createElement('span');
+      amountLabel.className = 'cell-amount';
+      amountLabel.innerText = item.paid ? formatMoney(item.amount) : '—';
+
+      button.append(dayLabel, amountLabel);
+      button.addEventListener('click', async () => {
+        const initial = item.paid ? String(item.amount) : '';
         const answer = prompt(
-          `День ${d}. Введите сумму накопления в рублях.\n` +
-          'Чтобы отменить отметку дня, введите 0.',
-          current
+          `День ${d}. Введите фактически отложенную сумму в рублях.\n` +
+          'Ноль снимает отметку, ранее введённая сумма при этом сохраняется.',
+          initial
         );
-        if (answer === null) return;
+        if (answer === null || answer.trim() === '') return;
 
         const amount = Number(answer.trim().replace(',', '.'));
         if (!Number.isFinite(amount) || amount < 0) {
-          alert('Введите корректную неотрицательную сумму.');
+          alert('Введите корректную сумму, не меньше нуля.');
           return;
         }
 
         try {
-          const saveRes = await fetch(`/api/savings/${d}`, {
-            method: 'PUT',
-            headers: getAuthHeaders(),
-            body: JSON.stringify({ amount: amount, paid: amount > 0 })
-          });
-
-          if (saveRes.status === 401) {
-            localStorage.removeItem('auth_token');
-            showLoginScreen();
-            return;
-          }
-          if (!saveRes.ok) {
-            const detail = await saveRes.text();
-            throw new Error(detail || 'Не удалось сохранить');
-          }
-
-          await loadSavings();
-        } catch (e) {
-          alert('Ошибка сохранения: ' + e.message);
-        }
-      };
-
-      cell.addEventListener('click', editDay);
-      cell.addEventListener('keydown', e => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          editDay();
+          const savedAmount = amount === 0 && item.paid
+            ? Number(item.amount) || 0
+            : amount;
+          await saveSaving(d, savedAmount, amount > 0);
+        } catch (error) {
+          alert('Ошибка сохранения: ' + error.message);
         }
       });
 
+      cell.appendChild(button);
       grid.appendChild(cell);
     }
-  } catch (err) {
-    console.error(err);
-    alert('Ошибка: ' + err.message);
+  } catch (error) {
+    console.error(error);
+    alert('Ошибка: ' + error.message);
   }
 }
+
+document.getElementById('settings-save').addEventListener('click', saveSavingsSettings);
 
 // --- Старт страницы ---
 const savedToken = localStorage.getItem('auth_token');

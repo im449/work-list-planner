@@ -95,6 +95,14 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS savings_settings (
+            user_id INTEGER PRIMARY KEY,
+            goal REAL NOT NULL DEFAULT 100000,
+            days INTEGER NOT NULL DEFAULT 365
+        )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -488,10 +496,67 @@ async def generate_report(request: Request, current_user: dict = Depends(get_cur
 
 
 # === НАКОПЛЕНИЯ ===
+@app.get("/api/savings/settings")
+async def get_savings_settings(current_user: dict = Depends(get_current_user)):
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO savings_settings (user_id, goal, days) VALUES (?, 100000, 365)",
+            (current_user["id"],)
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT goal, days FROM savings_settings WHERE user_id = ?",
+            (current_user["id"],)
+        ).fetchone()
+        return {"goal": row["goal"], "days": row["days"]}
+    finally:
+        conn.close()
+
+
+@app.put("/api/savings/settings")
+async def update_savings_settings(
+    item: dict,
+    current_user: dict = Depends(get_current_user)
+):
+    try:
+        goal = float(item.get("goal", 0))
+        days = int(item.get("days", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Укажите корректную цель и срок")
+
+    if not 0 < goal <= 1000000000000:
+        raise HTTPException(status_code=400, detail="Цель должна быть больше нуля")
+    if not 1 <= days <= 3650:
+        raise HTTPException(status_code=400, detail="Срок должен быть от 1 до 3650 дней")
+
+    conn = db()
+    try:
+        conn.execute(
+            """
+            INSERT INTO savings_settings (user_id, goal, days)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id)
+            DO UPDATE SET goal = excluded.goal, days = excluded.days
+            """,
+            (current_user["id"], goal, days)
+        )
+        conn.commit()
+        return {"goal": goal, "days": days}
+    finally:
+        conn.close()
+
+
 @app.get("/api/savings")
 async def get_savings(current_user: dict = Depends(get_current_user)):
     conn = db()
     try:
+        settings = conn.execute(
+            "SELECT days FROM savings_settings WHERE user_id = ?",
+            (current_user["id"],)
+        ).fetchone()
+        days = int(settings["days"]) if settings else 365
+
         rows = conn.execute(
             "SELECT day, amount, paid FROM savings WHERE user_id = ? ORDER BY day",
             (current_user["id"],)
@@ -508,7 +573,7 @@ async def get_savings(current_user: dict = Depends(get_current_user)):
 
         return [
             saved.get(day, {"day": day, "amount": 0, "paid": False})
-            for day in range(1, 366)
+            for day in range(1, days + 1)
         ]
     finally:
         conn.close()
@@ -520,8 +585,8 @@ async def update_saving(
     item: dict,
     current_user: dict = Depends(get_current_user)
 ):
-    if day < 1 or day > 365:
-        raise HTTPException(status_code=400, detail="День должен быть от 1 до 365")
+    if day < 1 or day > 3650:
+        raise HTTPException(status_code=400, detail="Некорректный номер дня")
 
     try:
         amount = float(item.get("amount", 0))
@@ -535,6 +600,17 @@ async def update_saving(
 
     conn = db()
     try:
+        settings = conn.execute(
+            "SELECT days FROM savings_settings WHERE user_id = ?",
+            (current_user["id"],)
+        ).fetchone()
+        max_days = int(settings["days"]) if settings else 365
+        if day > max_days:
+            raise HTTPException(
+                status_code=400,
+                detail=f"День должен быть от 1 до {max_days}"
+            )
+
         conn.execute(
             """
             INSERT INTO savings (user_id, day, amount, paid)
