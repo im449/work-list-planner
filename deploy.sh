@@ -15,11 +15,30 @@ echo "=== Проверяем Python ==="
 echo "=== Перезапускаем сервис ==="
 systemctl restart "$SERVICE"
 
-echo "=== Проверяем сервис ==="
-sleep 2
+echo "=== Ожидаем готовности сервиса (до 30 секунд) ==="
+READY=0
 
-if ! systemctl is-active --quiet "$SERVICE"; then
-    echo "ОШИБКА: сервис не активен"
+for ATTEMPT in $(seq 1 15); do
+    if ! systemctl is-active --quiet "$SERVICE"; then
+        echo "ОШИБКА: сервис не активен"
+        systemctl status "$SERVICE" --no-pager || true
+        journalctl -u "$SERVICE" -n 50 --no-pager || true
+        exit 1
+    fi
+
+    if curl --connect-timeout 2 --max-time 3 -sS -o /dev/null \
+        http://127.0.0.1:8000/ 2>/dev/null; then
+        READY=1
+        echo "Приложение отвечает"
+        break
+    fi
+
+    echo "Приложение пока не отвечает (попытка $ATTEMPT/15)"
+    sleep 2
+done
+
+if [ "$READY" -ne 1 ]; then
+    echo "ОШИБКА: приложение не стало доступно за 30 секунд"
     systemctl status "$SERVICE" --no-pager || true
     journalctl -u "$SERVICE" -n 50 --no-pager || true
     exit 1
