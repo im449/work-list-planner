@@ -58,6 +58,44 @@
     #archive-list { display: none; }
     .archive-header { margin-bottom: 10px; color: #555; font-size: 15px; }
     .archive-empty { color: #888; font-size: 14px; background: white; border-radius: 8px; padding: 16px; text-align: center; }
+
+    .user-activity-panel {
+      margin-top: 18px;
+      padding: 16px;
+      background: white;
+      border-radius: 8px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+    }
+    .user-activity-heading {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .user-activity-heading h2 { font-size: 18px; color: #333; }
+    .user-activity-panel p { color: #777; font-size: 13px; margin-bottom: 12px; }
+    .user-activity-refresh {
+      padding: 6px 12px;
+      border: 0;
+      border-radius: 5px;
+      background: #e9eef5;
+      cursor: pointer;
+    }
+    .user-activity-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .user-activity-table th, .user-activity-table td {
+      text-align: left;
+      padding: 9px 7px;
+      border-bottom: 1px solid #eee;
+    }
+    .user-activity-table th { color: #666; font-weight: 600; }
+    .activity-status { font-weight: 600; }
+    .activity-muted { color: #888; }
+    @media (max-width: 650px) {
+      .user-activity-table { font-size: 12px; }
+      .user-activity-table th, .user-activity-table td { padding: 7px 4px; }
+    }
   </style>
 </head>
 <body>
@@ -107,6 +145,15 @@
       </div>
     </div>
   </div>
+
+  <section id="user-activity-panel" class="user-activity-panel" style="display:none">
+    <div class="user-activity-heading">
+      <h2>Пользователи и активность</h2>
+      <button class="user-activity-refresh" onclick="loadUserActivity()">Обновить</button>
+    </div>
+    <p id="user-activity-summary">Загрузка данных...</p>
+    <div id="user-activity-list"></div>
+  </section>
 
 <script>
 function escapeHtml(t){if(!t)return'';return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;');}
@@ -180,6 +227,7 @@ async function handleAuth() {
       document.getElementById('current-user').innerText = 'Вы: ' + username;
       hideLoginScreen();
       loadTasks();
+      loadUserActivity();
     }
   } catch (err) {
     errorEl.innerText = err.message || 'Ошибка авторизации';
@@ -358,6 +406,111 @@ async function downloadPDF() {
   }
 }
 
+
+function formatActivityDate(value) {
+  if (!value) return '—';
+  const normalized = value.includes('T') ? value : value.replace(' ', 'T') + 'Z';
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return escapeHtml(value);
+  return date.toLocaleString('ru-RU', {
+    day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: '2-digit', minute: '2-digit'
+  });
+}
+
+function describeActivity(value) {
+  if (!value) return 'Пока не зафиксирована';
+  const normalized = value.includes('T') ? value : value.replace(' ', 'T') + 'Z';
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return 'Дата неизвестна';
+
+  const days = Math.max(0, Math.floor((Date.now() - date.getTime()) / 86400000));
+  if (days === 0) return 'Сегодня';
+  if (days === 1) return 'Вчера';
+  if (days < 30) return days + ' дн. назад';
+  return 'Более 30 дней назад';
+}
+
+async function loadUserActivity() {
+  const panel = document.getElementById('user-activity-panel');
+  const summary = document.getElementById('user-activity-summary');
+  const list = document.getElementById('user-activity-list');
+  if (!panel || !localStorage.getItem('auth_token')) {
+    if (panel) panel.style.display = 'none';
+    return;
+  }
+
+  try {
+    const meResponse = await fetch('/users/me', { headers: getAuthHeaders() });
+    if (!meResponse.ok) {
+      panel.style.display = 'none';
+      return;
+    }
+
+    const me = await meResponse.json();
+    if (me.role !== 'admin') {
+      panel.style.display = 'none';
+      return;
+    }
+
+    panel.style.display = 'block';
+    summary.innerText = 'Загружаем список пользователей...';
+
+    const response = await fetch('/admin/activity', { headers: getAuthHeaders() });
+    if (!response.ok) throw new Error('Не удалось загрузить список: ' + response.status);
+
+    const users = await response.json();
+    const now = Date.now();
+    const weekAgo = now - 7 * 86400000;
+    const recentRegistrations = users.filter(user => {
+      if (!user.created_at) return false;
+      const value = user.created_at.includes('T')
+        ? user.created_at
+        : user.created_at.replace(' ', 'T') + 'Z';
+      const date = new Date(value);
+      return !Number.isNaN(date.getTime()) && date.getTime() >= weekAgo;
+    }).length;
+
+    summary.innerText =
+      'Всего аккаунтов: ' + users.length +
+      ' · Новых за 7 дней: ' + recentRegistrations;
+
+    if (!users.length) {
+      list.innerHTML = '<div class="activity-muted">Пользователей пока нет.</div>';
+      return;
+    }
+
+    list.innerHTML = `
+      <table class="user-activity-table">
+        <thead><tr>
+          <th>Пользователь</th>
+          <th>Регистрация</th>
+          <th>Последняя активность</th>
+          <th>Статус</th>
+        </tr></thead>
+        <tbody>
+          ${users.map(user => `
+            <tr>
+              <td>${escapeHtml(String(user.username || ''))}</td>
+              <td>${formatActivityDate(user.created_at)}</td>
+              <td title="${escapeHtml(formatActivityDate(user.last_seen))}">
+                ${describeActivity(user.last_seen)}
+              </td>
+              <td class="activity-status" style="color:${user.is_active ? '#218838' : '#dc3545'}">
+                ${user.is_active ? 'Активен' : 'Заблокирован'}
+              </td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>`;
+  } catch (error) {
+    panel.style.display = 'block';
+    summary.innerText = 'Не удалось обновить данные. Попробуйте ещё раз.';
+    list.innerHTML = '';
+    console.error('Ошибка панели активности:', error);
+  }
+}
+
 // === Старт страницы ===
 const savedToken = localStorage.getItem('auth_token');
 const savedUsername = localStorage.getItem('username');
@@ -368,6 +521,7 @@ if (savedToken) {
   }
   hideLoginScreen();
   loadTasks();
+  loadUserActivity();
 } else {
   showLoginScreen();
 }

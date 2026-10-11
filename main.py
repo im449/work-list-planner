@@ -74,6 +74,23 @@ def init_db():
     if "role" not in user_cols:
         c.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'")
 
+    if "is_active" not in user_cols:
+        c.execute("ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1")
+
+    if "last_seen" not in user_cols:
+        c.execute("ALTER TABLE users ADD COLUMN last_seen TEXT")
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    c.execute("""
+        INSERT OR IGNORE INTO app_settings (key, value)
+        VALUES ('registrations_enabled', '1')
+    """)
+
     task_cols = [r["name"] for r in c.execute("PRAGMA table_info(tasks)")]
     if "user_id" not in task_cols:
         c.execute("ALTER TABLE tasks ADD COLUMN user_id INTEGER")
@@ -118,10 +135,10 @@ def get_password_hash(password):
 def authenticate_user(username: str, password: str):
     conn = db()
     row = conn.execute(
-        "SELECT id, username, password_hash, role FROM users WHERE username = ?", (username,)
+        "SELECT id, username, password_hash, role, is_active FROM users WHERE username = ?", (username,)
     ).fetchone()
     conn.close()
-    if not row or not verify_password(password, row["password_hash"]):
+    if not row or not row["is_active"] or not verify_password(password, row["password_hash"]):
         return False
     return {"id": row["id"], "username": row["username"], "role": row["role"]}
 
@@ -146,16 +163,44 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
 
     conn = db()
-    row = conn.execute("SELECT id, username, role FROM users WHERE username = ?", (username,)).fetchone()
-    conn.close()
-    if not row:
-        raise credentials_exception
-    return {"id": row["id"], "username": row["username"], "role": row["role"]}
+    try:
+        row = conn.execute(
+            "SELECT id, username, role, is_active FROM users WHERE username = ?",
+            (username,)
+        ).fetchone()
+
+        if not row or not row["is_active"]:
+            raise credentials_exception
+
+        # Не чаще одного обновления за пять минут для каждого пользователя.
+        conn.execute("""
+            UPDATE users
+            SET last_seen = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND (
+                  last_seen IS NULL
+                  OR datetime(last_seen) < datetime('now', '-5 minutes')
+              )
+        """, (row["id"],))
+        conn.commit()
+
+        return {
+            "id": row["id"],
+            "username": row["username"],
+            "role": row["role"]
+        }
+    finally:
+        conn.close()
 
 async def require_admin(user: dict = Depends(get_current_user)):
     if user["role"] != "admin":
         raise HTTPException(status_code=403, detail="Требуются права администратора")
     return user
+
+@app.get("/users/me")
+async def read_current_user(current_user: dict = Depends(get_current_user)):
+    return current_user
+
 
 # === ЭНДПОИНТЫ АВТОРИЗАЦИИ ===
 @app.post("/token")
@@ -178,6 +223,13 @@ async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends
 @limiter.limit("5/minute")
 async def register_user(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
     conn = db()
+    setting = conn.execute(
+        "SELECT value FROM app_settings WHERE key = 'registrations_enabled'"
+    ).fetchone()
+    if not setting or setting["value"] != "1":
+        conn.close()
+        raise HTTPException(status_code=403, detail="Регистрация временно отключена")
+
     if conn.execute("SELECT 1 FROM users WHERE username = ?", (form_data.username,)).fetchone():
         conn.close()
         raise HTTPException(status_code=400, detail="Пользователь уже существует")
@@ -339,16 +391,61 @@ async def restore_task(task_id: int, current_user: dict = Depends(get_current_us
     return {"status": "ok"}
 
 # === АДМИНКА ===
+@app.get("/admin/settings/registrations")
+async def get_registration_setting(admin: dict = Depends(require_admin)):
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_settings WHERE key = 'registrations_enabled'"
+        ).fetchone()
+        return {"enabled": bool(row and row["value"] == "1")}
+    finally:
+        conn.close()
+
+
+@app.post("/admin/settings/registrations")
+async def set_registration_setting(data: dict, admin: dict = Depends(require_admin)):
+    enabled = data.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=400, detail="'enabled' должен быть true или false")
+
+    conn = db()
+    try:
+        conn.execute(
+            "UPDATE app_settings SET value = ? WHERE key = 'registrations_enabled'",
+            ("1" if enabled else "0",)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"enabled": enabled}
+
+
 @app.get("/admin/users")
 async def admin_list_users(admin: dict = Depends(require_admin)):
     conn = db()
     rows = conn.execute("""
-        SELECT u.id, u.username, u.role, u.created_at,
+        SELECT u.id, u.username, u.role, u.created_at, u.is_active,
                (SELECT COUNT(*) FROM tasks t WHERE t.user_id = u.id) AS task_count
         FROM users u ORDER BY u.id
     """).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+@app.get("/admin/activity")
+async def admin_user_activity(admin: dict = Depends(require_admin)):
+    conn = db()
+    try:
+        rows = conn.execute("""
+            SELECT id, username, created_at, role, is_active, last_seen
+            FROM users
+            ORDER BY datetime(created_at) DESC, id DESC
+        """).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
 
 @app.post("/admin/users/{user_id}/role")
 async def admin_set_role(user_id: int, data: dict, admin: dict = Depends(require_admin)):
@@ -362,6 +459,31 @@ async def admin_set_role(user_id: int, data: dict, admin: dict = Depends(require
     conn.commit()
     conn.close()
     return {"status": "ok"}
+
+@app.post("/admin/users/{user_id}/active")
+async def admin_set_active(user_id: int, data: dict, admin: dict = Depends(require_admin)):
+    active = data.get("is_active")
+    if not isinstance(active, bool):
+        raise HTTPException(status_code=400, detail="is_active должен быть true или false")
+
+    if user_id == admin["id"] and not active:
+        raise HTTPException(status_code=400, detail="Нельзя заблокировать самого себя")
+
+    conn = db()
+    try:
+        cur = conn.execute(
+            "UPDATE users SET is_active = ? WHERE id = ?",
+            (1 if active else 0, user_id)
+        )
+        if cur.rowcount == 0:
+            conn.rollback()
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"status": "ok", "user_id": user_id, "is_active": active}
+
 
 @app.delete("/admin/users/{user_id}")
 async def admin_delete_user(user_id: int, admin: dict = Depends(require_admin)):
