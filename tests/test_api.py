@@ -1,15 +1,9 @@
-import os
-import tempfile
-
-# Путь к тестовой базе должен быть установлен ДО импорта main
-tmp_db = os.path.join(tempfile.gettempdir(), "test_planner.db")
-if os.path.exists(tmp_db):
-    os.remove(tmp_db)
-os.environ["DB_PATH"] = tmp_db
-os.environ["SECRET_KEY"] = "test-secret-key"
-
 from fastapi.testclient import TestClient
-from main import app
+from main import app, limiter
+
+# Отключаем rate limit только в отдельном процессе тестов.
+# В работающем production-процессе эта настройка не меняется.
+limiter.enabled = False
 
 client = TestClient(app)
 
@@ -73,3 +67,193 @@ def test_delete_task():
 
     resp = client.get("/tasks", headers=headers)
     assert task_id not in [t["id"] for t in resp.json()]
+
+# === ТЕСТЫ КОПИЛКИ ===
+
+def create_goal(headers, name="Тестовая цель", goal=1000, days=3):
+    return client.post(
+        "/api/savings/goals",
+        json={
+            "name": name,
+            "goal": goal,
+            "days": days,
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-03",
+        },
+        headers=headers,
+    )
+
+
+def test_savings_goals_create_and_list():
+    headers = register_and_login("savings_list_test")
+    first = create_goal(headers, "Отпуск", 5000)
+    second = create_goal(headers, "Резерв", 10000)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["name"] == "Отпуск"
+    assert second.json()["goal"] == 10000
+
+    response = client.get("/api/savings/goals", headers=headers)
+    assert response.status_code == 200
+    goals = response.json()
+    names = [goal["name"] for goal in goals]
+    assert "Отпуск" in names
+    assert "Резерв" in names
+
+
+def test_savings_goal_update():
+    headers = register_and_login("savings_update_test")
+    created = create_goal(headers)
+    assert created.status_code == 200, created.text
+    goal_id = created.json()["id"]
+
+    response = client.put(
+        f"/api/savings/goals/{goal_id}",
+        json={
+            "name": "Обновлённая цель",
+            "goal": 2500,
+            "days": 3,
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-03",
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["name"] == "Обновлённая цель"
+    assert response.json()["goal"] == 2500
+
+
+def test_savings_calendar_save_and_read():
+    headers = register_and_login("savings_calendar_test")
+    created = create_goal(headers)
+    assert created.status_code == 200, created.text
+    goal_id = created.json()["id"]
+
+    saved = client.put(
+        f"/api/savings/1?goal_id={goal_id}",
+        json={"amount": 125.50, "paid": True},
+        headers=headers,
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["amount"] == 125.50
+    assert saved.json()["paid"] is True
+
+    response = client.get(
+        f"/api/savings?goal_id={goal_id}",
+        headers=headers,
+    )
+    assert response.status_code == 200
+    calendar = response.json()
+    assert len(calendar) == 3
+    assert calendar[0]["amount"] == 125.50
+    assert calendar[0]["paid"] is True
+    assert calendar[1]["amount"] == 0
+    assert calendar[1]["paid"] is False
+
+
+def test_savings_summary_counts_only_paid_entries():
+    headers = register_and_login("savings_summary_test")
+    created = create_goal(headers, "Сводка", 1000)
+    assert created.status_code == 200, created.text
+    goal_id = created.json()["id"]
+
+    for day, amount, paid in [(1, 100, True), (2, 50, False)]:
+        response = client.put(
+            f"/api/savings/{day}?goal_id={goal_id}",
+            json={"amount": amount, "paid": paid},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+
+    response = client.get("/api/savings/summary", headers=headers)
+    assert response.status_code == 200, response.text
+    summary = response.json()
+    target = next(item for item in summary["goals"] if item["id"] == goal_id)
+    assert target["saved"] == 100
+    assert target["remaining"] == 900
+    assert target["progress_percent"] == 10
+
+
+def test_savings_archive_and_restore():
+    headers = register_and_login("savings_archive_test")
+    created = create_goal(headers, "В архив", 500)
+    assert created.status_code == 200, created.text
+    goal_id = created.json()["id"]
+
+    archived = client.post(
+        f"/api/savings/goals/{goal_id}/archive",
+        headers=headers,
+    )
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["archived"] is True
+    # Архивирование последней активной цели создаёт замену.
+    assert archived.json()["replacement_id"] is not None
+
+    archive_list = client.get(
+        "/api/savings/goals?archived=true",
+        headers=headers,
+    )
+    assert archive_list.status_code == 200
+    assert any(item["id"] == goal_id for item in archive_list.json())
+
+    restored = client.post(
+        f"/api/savings/goals/{goal_id}/restore",
+        headers=headers,
+    )
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["id"] == goal_id
+
+    active = client.get("/api/savings/goals", headers=headers)
+    assert active.status_code == 200
+    assert any(item["id"] == goal_id for item in active.json())
+
+
+def test_savings_rejects_negative_amount():
+    headers = register_and_login("savings_invalid_test")
+    created = create_goal(headers)
+    assert created.status_code == 200, created.text
+    goal_id = created.json()["id"]
+
+    response = client.put(
+        f"/api/savings/1?goal_id={goal_id}",
+        json={"amount": -1, "paid": True},
+        headers=headers,
+    )
+    assert response.status_code == 400
+
+
+def test_savings_goal_is_private_to_owner():
+    owner_headers = register_and_login("savings_owner_test")
+    other_headers = register_and_login("savings_other_test")
+
+    created = create_goal(owner_headers, "Личная цель")
+    assert created.status_code == 200, created.text
+    goal_id = created.json()["id"]
+
+    response = client.put(
+        f"/api/savings/goals/{goal_id}",
+        json={"name": "Чужое изменение"},
+        headers=other_headers,
+    )
+    assert response.status_code == 404
+
+
+def test_cannot_delete_last_active_savings_goal():
+    headers = register_and_login("savings_delete_test")
+    first = create_goal(headers, "Первая")
+    second = create_goal(headers, "Вторая")
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+
+    deleted = client.delete(
+        f"/api/savings/goals/{first.json()['id']}",
+        headers=headers,
+    )
+    assert deleted.status_code == 200, deleted.text
+
+    last = client.delete(
+        f"/api/savings/goals/{second.json()['id']}",
+        headers=headers,
+    )
+    assert last.status_code == 400

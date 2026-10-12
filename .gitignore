@@ -31,3 +31,6 @@ savings.html.backup_*
 
 # Кэш шрифтов PDF
 *.pkl
+
+# Тестовое виртуальное окружение
+.venv-test/
