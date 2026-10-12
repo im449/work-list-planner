@@ -120,6 +120,31 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS savings_goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            goal REAL NOT NULL DEFAULT 100000,
+            days INTEGER NOT NULL DEFAULT 365,
+            archived INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_savings_goals_user ON savings_goals(user_id, archived, id)")
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS savings_goal_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            goal_id INTEGER NOT NULL,
+            day INTEGER NOT NULL,
+            amount REAL NOT NULL DEFAULT 0,
+            paid INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(goal_id, day),
+            FOREIGN KEY(goal_id) REFERENCES savings_goals(id)
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_savings_goal_entries_goal ON savings_goal_entries(goal_id, day)")
+
     conn.commit()
     conn.close()
 
@@ -618,20 +643,262 @@ async def generate_report(request: Request, current_user: dict = Depends(get_cur
 
 
 # === НАКОПЛЕНИЯ ===
-@app.get("/api/savings/settings")
-async def get_savings_settings(current_user: dict = Depends(get_current_user)):
+def _ensure_savings_goal(conn, user_id: int):
+    """Return the user's first active goal, migrating their old single goal on first use."""
+    row = conn.execute(
+        "SELECT id, user_id, name, goal, days FROM savings_goals "
+        "WHERE user_id = ? AND archived = 0 ORDER BY id LIMIT 1",
+        (user_id,)
+    ).fetchone()
+    if row:
+        return row
+
+    # Preserve settings and daily contributions stored in the legacy single-goal tables.
+    legacy_settings = conn.execute(
+        "SELECT goal, days FROM savings_settings WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    goal = float(legacy_settings["goal"]) if legacy_settings else 100000.0
+    days = int(legacy_settings["days"]) if legacy_settings else 365
+    cursor = conn.execute(
+        "INSERT INTO savings_goals (user_id, name, goal, days) VALUES (?, ?, ?, ?)",
+        (user_id, "Моя копилка", goal, days)
+    )
+    goal_id = cursor.lastrowid
+    legacy_entries = conn.execute(
+        "SELECT day, amount, paid FROM savings WHERE user_id = ? ORDER BY day", (user_id,)
+    ).fetchall()
+    if legacy_entries:
+        conn.executemany(
+            "INSERT OR IGNORE INTO savings_goal_entries (goal_id, day, amount, paid) "
+            "VALUES (?, ?, ?, ?)",
+            [(goal_id, entry["day"], entry["amount"], entry["paid"]) for entry in legacy_entries]
+        )
+    conn.commit()
+    return conn.execute(
+        "SELECT id, user_id, name, goal, days FROM savings_goals WHERE id = ? AND user_id = ?",
+        (goal_id, user_id)
+    ).fetchone()
+
+
+def _get_savings_goal(conn, user_id: int, goal_id: int | None = None):
+    if goal_id is None:
+        return _ensure_savings_goal(conn, user_id)
+    row = conn.execute(
+        "SELECT id, user_id, name, goal, days FROM savings_goals "
+        "WHERE id = ? AND user_id = ? AND archived = 0",
+        (goal_id, user_id)
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Копилка не найдена")
+    return row
+
+
+def _parse_savings_goal(item: dict, current=None):
+    try:
+        default_goal = current["goal"] if current else 100000
+        default_days = current["days"] if current else 365
+        goal = float(item.get("goal", default_goal))
+        days = int(item.get("days", default_days))
+        name = str(item.get("name", current["name"] if current else "Моя копилка")).strip()
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Укажите корректное название, цель и срок")
+    if not name or len(name) > 80:
+        raise HTTPException(status_code=400, detail="Название копилки должно содержать от 1 до 80 символов")
+    if not 0 < goal <= 1000000000000:
+        raise HTTPException(status_code=400, detail="Цель должна быть больше нуля")
+    if not 1 <= days <= 3650:
+        raise HTTPException(status_code=400, detail="Срок должен быть от 1 до 3650 дней")
+    return name, goal, days
+
+
+def _goal_payload(row):
+    return {
+        "id": int(row["id"]),
+        "name": row["name"],
+        "goal": float(row["goal"]),
+        "days": int(row["days"]),
+    }
+
+
+@app.get("/api/savings/goals")
+async def get_savings_goals(
+    archived: bool = False,
+    current_user: dict = Depends(get_current_user)
+):
     conn = db()
     try:
-        conn.execute(
-            "INSERT OR IGNORE INTO savings_settings (user_id, goal, days) VALUES (?, 100000, 365)",
-            (current_user["id"],)
+        # Active-goal requests retain the original lazy migration behavior.
+        # Archive queries must not create a new goal as a side effect.
+        if not archived:
+            _ensure_savings_goal(conn, current_user["id"])
+        rows = conn.execute(
+            "SELECT id, name, goal, days FROM savings_goals "
+            "WHERE user_id = ? AND archived = ? ORDER BY id",
+            (current_user["id"], 1 if archived else 0)
+        ).fetchall()
+        return [_goal_payload(row) for row in rows]
+    finally:
+        conn.close()
+
+
+@app.post("/api/savings/goals")
+async def create_savings_goal(
+    item: dict,
+    current_user: dict = Depends(get_current_user)
+):
+    name, goal, days = _parse_savings_goal(item)
+    conn = db()
+    try:
+        cursor = conn.execute(
+            "INSERT INTO savings_goals (user_id, name, goal, days) VALUES (?, ?, ?, ?)",
+            (current_user["id"], name, goal, days)
         )
         conn.commit()
         row = conn.execute(
-            "SELECT goal, days FROM savings_settings WHERE user_id = ?",
-            (current_user["id"],)
+            "SELECT id, name, goal, days FROM savings_goals WHERE id = ? AND user_id = ?",
+            (cursor.lastrowid, current_user["id"])
         ).fetchone()
-        return {"goal": row["goal"], "days": row["days"]}
+        return _goal_payload(row)
+    finally:
+        conn.close()
+
+
+@app.put("/api/savings/goals/{goal_id}")
+async def rename_savings_goal(
+    goal_id: int,
+    item: dict,
+    current_user: dict = Depends(get_current_user)
+):
+    conn = db()
+    try:
+        current = _get_savings_goal(conn, current_user["id"], goal_id)
+        name, goal, days = _parse_savings_goal(item, current)
+        conn.execute(
+            "UPDATE savings_goals SET name = ?, goal = ?, days = ? WHERE id = ? AND user_id = ?",
+            (name, goal, days, goal_id, current_user["id"])
+        )
+        conn.commit()
+        updated = conn.execute(
+            "SELECT id, name, goal, days FROM savings_goals WHERE id = ? AND user_id = ?",
+            (goal_id, current_user["id"])
+        ).fetchone()
+        return _goal_payload(updated)
+    finally:
+        conn.close()
+
+
+@app.post("/api/savings/goals/{goal_id}/archive")
+async def archive_savings_goal(
+    goal_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Archive a goal. If it is the last active goal, create a fresh empty replacement."""
+    conn = db()
+    try:
+        goal = conn.execute(
+            "SELECT id, name, goal, days FROM savings_goals "
+            "WHERE id = ? AND user_id = ? AND archived = 0",
+            (goal_id, current_user["id"])
+        ).fetchone()
+        if not goal:
+            raise HTTPException(status_code=404, detail="Активная копилка не найдена")
+
+        active_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM savings_goals WHERE user_id = ? AND archived = 0",
+            (current_user["id"],)
+        ).fetchone()["n"]
+        conn.execute(
+            "UPDATE savings_goals SET archived = 1 WHERE id = ? AND user_id = ?",
+            (goal_id, current_user["id"])
+        )
+        replacement_id = None
+        if active_count <= 1:
+            cursor = conn.execute(
+                "INSERT INTO savings_goals (user_id, name, goal, days) VALUES (?, ?, ?, ?)",
+                (current_user["id"], "Новая копилка", float(goal["goal"]), int(goal["days"]))
+            )
+            replacement_id = int(cursor.lastrowid)
+        conn.commit()
+        return {"archived": True, "replacement_id": replacement_id}
+    finally:
+        conn.close()
+
+
+@app.post("/api/savings/goals/{goal_id}/restore")
+async def restore_savings_goal(
+    goal_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    conn = db()
+    try:
+        goal = conn.execute(
+            "SELECT id, name, goal, days FROM savings_goals "
+            "WHERE id = ? AND user_id = ? AND archived = 1",
+            (goal_id, current_user["id"])
+        ).fetchone()
+        if not goal:
+            raise HTTPException(status_code=404, detail="Архивная копилка не найдена")
+        conn.execute(
+            "UPDATE savings_goals SET archived = 0 WHERE id = ? AND user_id = ?",
+            (goal_id, current_user["id"])
+        )
+        conn.commit()
+        restored = conn.execute(
+            "SELECT id, name, goal, days FROM savings_goals WHERE id = ? AND user_id = ?",
+            (goal_id, current_user["id"])
+        ).fetchone()
+        return _goal_payload(restored)
+    finally:
+        conn.close()
+
+
+@app.delete("/api/savings/goals/{goal_id}")
+async def delete_savings_goal(
+    goal_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    """Permanently delete a goal and its entries; never leave the user without an active goal."""
+    conn = db()
+    try:
+        goal = conn.execute(
+            "SELECT id, archived FROM savings_goals WHERE id = ? AND user_id = ?",
+            (goal_id, current_user["id"])
+        ).fetchone()
+        if not goal:
+            raise HTTPException(status_code=404, detail="Копилка не найдена")
+        if not goal["archived"]:
+            active_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM savings_goals WHERE user_id = ? AND archived = 0",
+                (current_user["id"],)
+            ).fetchone()["n"]
+            if active_count <= 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Нельзя удалить последнюю активную копилку. Создайте другую или отправьте эту в архив."
+                )
+        conn.execute(
+            "DELETE FROM savings_goal_entries WHERE goal_id = ?",
+            (goal_id,)
+        )
+        conn.execute(
+            "DELETE FROM savings_goals WHERE id = ? AND user_id = ?",
+            (goal_id, current_user["id"])
+        )
+        conn.commit()
+        return {"deleted": True, "id": goal_id}
+    finally:
+        conn.close()
+
+
+@app.get("/api/savings/settings")
+async def get_savings_settings(
+    goal_id: int | None = None,
+    current_user: dict = Depends(get_current_user)
+):
+    conn = db()
+    try:
+        row = _get_savings_goal(conn, current_user["id"], goal_id)
+        return _goal_payload(row)
     finally:
         conn.close()
 
@@ -639,51 +906,35 @@ async def get_savings_settings(current_user: dict = Depends(get_current_user)):
 @app.put("/api/savings/settings")
 async def update_savings_settings(
     item: dict,
+    goal_id: int | None = None,
     current_user: dict = Depends(get_current_user)
 ):
-    try:
-        goal = float(item.get("goal", 0))
-        days = int(item.get("days", 0))
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="Укажите корректную цель и срок")
-
-    if not 0 < goal <= 1000000000000:
-        raise HTTPException(status_code=400, detail="Цель должна быть больше нуля")
-    if not 1 <= days <= 3650:
-        raise HTTPException(status_code=400, detail="Срок должен быть от 1 до 3650 дней")
-
     conn = db()
     try:
+        current = _get_savings_goal(conn, current_user["id"], goal_id)
+        name, goal, days = _parse_savings_goal(item, current)
         conn.execute(
-            """
-            INSERT INTO savings_settings (user_id, goal, days)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id)
-            DO UPDATE SET goal = excluded.goal, days = excluded.days
-            """,
-            (current_user["id"], goal, days)
+            "UPDATE savings_goals SET name = ?, goal = ?, days = ? WHERE id = ? AND user_id = ?",
+            (name, goal, days, current["id"], current_user["id"])
         )
         conn.commit()
-        return {"goal": goal, "days": days}
+        return {"id": int(current["id"]), "name": name, "goal": goal, "days": days}
     finally:
         conn.close()
 
 
 @app.get("/api/savings")
-async def get_savings(current_user: dict = Depends(get_current_user)):
+async def get_savings(
+    goal_id: int | None = None,
+    current_user: dict = Depends(get_current_user)
+):
     conn = db()
     try:
-        settings = conn.execute(
-            "SELECT days FROM savings_settings WHERE user_id = ?",
-            (current_user["id"],)
-        ).fetchone()
-        days = int(settings["days"]) if settings else 365
-
+        goal = _get_savings_goal(conn, current_user["id"], goal_id)
         rows = conn.execute(
-            "SELECT day, amount, paid FROM savings WHERE user_id = ? ORDER BY day",
-            (current_user["id"],)
+            "SELECT day, amount, paid FROM savings_goal_entries WHERE goal_id = ? ORDER BY day",
+            (goal["id"],)
         ).fetchall()
-
         saved = {
             row["day"]: {
                 "day": row["day"],
@@ -692,7 +943,7 @@ async def get_savings(current_user: dict = Depends(get_current_user)):
             }
             for row in rows
         }
-
+        days = int(goal["days"])
         return [
             saved.get(day, {"day": day, "amount": 0, "paid": False})
             for day in range(1, days + 1)
@@ -705,45 +956,34 @@ async def get_savings(current_user: dict = Depends(get_current_user)):
 async def update_saving(
     day: int,
     item: dict,
+    goal_id: int | None = None,
     current_user: dict = Depends(get_current_user)
 ):
     if day < 1 or day > 3650:
         raise HTTPException(status_code=400, detail="Некорректный номер дня")
-
     try:
         amount = float(item.get("amount", 0))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Некорректная сумма")
-
     if amount < 0:
         raise HTTPException(status_code=400, detail="Сумма не может быть отрицательной")
-
     paid = 1 if item.get("paid", False) else 0
 
     conn = db()
     try:
-        settings = conn.execute(
-            "SELECT days FROM savings_settings WHERE user_id = ?",
-            (current_user["id"],)
-        ).fetchone()
-        max_days = int(settings["days"]) if settings else 365
-        if day > max_days:
+        goal = _get_savings_goal(conn, current_user["id"], goal_id)
+        if day > int(goal["days"]):
             raise HTTPException(
                 status_code=400,
-                detail=f"День должен быть от 1 до {max_days}"
+                detail=f"День должен быть от 1 до {int(goal['days'])}"
             )
-
         conn.execute(
-            """
-            INSERT INTO savings (user_id, day, amount, paid)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id, day)
-            DO UPDATE SET amount = excluded.amount, paid = excluded.paid
-            """,
-            (current_user["id"], day, amount, paid)
+            "INSERT INTO savings_goal_entries (goal_id, day, amount, paid) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(goal_id, day) DO UPDATE SET amount = excluded.amount, paid = excluded.paid",
+            (goal["id"], day, amount, paid)
         )
         conn.commit()
-        return {"day": day, "amount": amount, "paid": bool(paid)}
+        return {"goal_id": int(goal["id"]), "day": day, "amount": amount, "paid": bool(paid)}
     finally:
         conn.close()
 

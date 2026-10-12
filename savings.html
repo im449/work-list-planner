@@ -58,8 +58,29 @@
   </div>
 
   <div class="stats-block">
+    <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:end; margin:12px 0 18px;">
+      <label>Выбранная копилка
+        <select id="goal-select" style="display:block; min-width:220px; padding:9px; margin-top:4px;"></select>
+      </label>
+      <button id="new-goal-btn" type="button" style="padding:9px 14px; cursor:pointer;">+ Новая копилка</button>
+      <button id="archive-goal-btn" type="button" style="padding:9px 14px; cursor:pointer;">В архив</button>
+      <button id="delete-goal-btn" type="button" style="padding:9px 14px; cursor:pointer;">Удалить</button>
+      <button id="toggle-archive-btn" type="button" style="padding:9px 14px; cursor:pointer;">Архив</button>
+    </div>
+    <div id="archive-panel" style="display:none; gap:10px; flex-wrap:wrap; align-items:end; margin:0 0 18px; padding:12px; border:1px solid #ddd; border-radius:8px;">
+      <label>Архивные копилки
+        <select id="archived-goal-select" style="display:block; min-width:220px; padding:9px; margin-top:4px;"></select>
+      </label>
+      <button id="restore-goal-btn" type="button" style="padding:9px 14px; cursor:pointer;">Восстановить</button>
+      <button id="delete-archived-goal-btn" type="button" style="padding:9px 14px; cursor:pointer;">Удалить из архива</button>
+      <span id="archive-empty" style="display:none;">Архив пока пуст.</span>
+    </div>
     <h3>Моя цель накоплений</h3>
     <div style="display:flex; gap:12px; flex-wrap:wrap; margin:12px 0;">
+      <label>Название копилки
+        <input id="goal-name-input" type="text" maxlength="80" value="Моя копилка"
+          style="display:block; width:220px; padding:8px; margin-top:4px;">
+      </label>
       <label>Цель, ₽
         <input id="goal-input" type="number" min="1" step="0.01" value="100000"
           style="display:block; width:180px; padding:8px; margin-top:4px;">
@@ -181,6 +202,7 @@ function getAuthHeaders() {
 // --- Логика страницы накоплений ---
 let SAVINGS_GOAL = 100000;
 let SAVINGS_DAYS = 365;
+let ACTIVE_SAVINGS_GOAL_ID = null;
 
 function formatMoney(value) {
   return Number(value || 0).toLocaleString('ru-RU', {
@@ -210,7 +232,7 @@ async function apiJson(url, options = {}) {
 }
 
 async function saveSaving(day, amount, paid) {
-  await apiJson(`/api/savings/${day}`, {
+  await apiJson(`/api/savings/${day}?goal_id=${encodeURIComponent(ACTIVE_SAVINGS_GOAL_ID)}`, {
     method: 'PUT',
     body: JSON.stringify({ amount, paid })
   });
@@ -218,9 +240,14 @@ async function saveSaving(day, amount, paid) {
 }
 
 async function saveSavingsSettings() {
+  const name = document.getElementById('goal-name-input').value.trim();
   const goal = Number(document.getElementById('goal-input').value);
   const days = Number(document.getElementById('days-input').value);
 
+  if (!name || name.length > 80) {
+    alert('Введите название копилки длиной от 1 до 80 символов.');
+    return;
+  }
   if (!Number.isFinite(goal) || goal <= 0) {
     alert('Укажите цель больше нуля.');
     return;
@@ -231,9 +258,9 @@ async function saveSavingsSettings() {
   }
 
   try {
-    await apiJson('/api/savings/settings', {
+    await apiJson(`/api/savings/settings?goal_id=${encodeURIComponent(ACTIVE_SAVINGS_GOAL_ID)}`, {
       method: 'PUT',
-      body: JSON.stringify({ goal, days })
+      body: JSON.stringify({ name, goal, days })
     });
     await loadSavings();
   } catch (error) {
@@ -243,15 +270,33 @@ async function saveSavingsSettings() {
 
 async function loadSavings() {
   try {
-    const settings = await apiJson('/api/savings/settings');
+    const goals = await apiJson('/api/savings/goals');
+    if (!Array.isArray(goals) || goals.length === 0) {
+      throw new Error('Не удалось загрузить список копилок.');
+    }
+    if (!ACTIVE_SAVINGS_GOAL_ID || !goals.some(goal => Number(goal.id) === Number(ACTIVE_SAVINGS_GOAL_ID))) {
+      ACTIVE_SAVINGS_GOAL_ID = Number(goals[0].id);
+    }
+    const goalSelect = document.getElementById('goal-select');
+    goalSelect.innerHTML = '';
+    goals.forEach(goal => {
+      const option = document.createElement('option');
+      option.value = String(goal.id);
+      option.textContent = goal.name;
+      goalSelect.appendChild(option);
+    });
+    goalSelect.value = String(ACTIVE_SAVINGS_GOAL_ID);
+
+    const settings = await apiJson(`/api/savings/settings?goal_id=${encodeURIComponent(ACTIVE_SAVINGS_GOAL_ID)}`);
     SAVINGS_GOAL = Number(settings.goal) || 100000;
     SAVINGS_DAYS = Number(settings.days) || 365;
+    document.getElementById('goal-name-input').value = settings.name || 'Моя копилка';
 
     document.getElementById('goal-input').value = SAVINGS_GOAL;
     document.getElementById('days-input').value = SAVINGS_DAYS;
     document.getElementById('days-total').innerText = SAVINGS_DAYS;
 
-    const items = await apiJson('/api/savings');
+    const items = await apiJson(`/api/savings?goal_id=${encodeURIComponent(ACTIVE_SAVINGS_GOAL_ID)}`);
     const paidItems = items.filter(item => item.paid);
     const totalSum = Math.round(
       paidItems.reduce((sum, item) => sum + (Number(item.amount) || 0), 0) * 100
@@ -350,6 +395,134 @@ async function loadSavings() {
 }
 
 document.getElementById('settings-save').addEventListener('click', saveSavingsSettings);
+
+document.getElementById('goal-select').addEventListener('change', async (event) => {
+  const nextId = Number(event.target.value);
+  if (!Number.isInteger(nextId) || nextId <= 0) return;
+  ACTIVE_SAVINGS_GOAL_ID = nextId;
+  await loadSavings();
+});
+
+document.getElementById('new-goal-btn').addEventListener('click', async () => {
+  const name = prompt('Название новой копилки:', 'Новая копилка');
+  if (name === null) return;
+  if (!name.trim() || name.trim().length > 80) {
+    alert('Название должно содержать от 1 до 80 символов.');
+    return;
+  }
+  try {
+    const created = await apiJson('/api/savings/goals', {
+      method: 'POST',
+      body: JSON.stringify({ name: name.trim(), goal: 100000, days: 365 })
+    });
+    ACTIVE_SAVINGS_GOAL_ID = Number(created.id);
+    await loadSavings();
+  } catch (error) {
+    alert('Не удалось создать копилку: ' + error.message);
+  }
+});
+
+async function refreshArchivedGoals() {
+  const select = document.getElementById('archived-goal-select');
+  const empty = document.getElementById('archive-empty');
+  const restoreButton = document.getElementById('restore-goal-btn');
+  const deleteButton = document.getElementById('delete-archived-goal-btn');
+  try {
+    const goals = await apiJson('/api/savings/goals?archived=true');
+    select.innerHTML = '';
+    goals.forEach(goal => {
+      const option = document.createElement('option');
+      option.value = String(goal.id);
+      option.textContent = `${goal.name} — ${formatMoney(goal.goal)}`;
+      select.appendChild(option);
+    });
+    empty.style.display = goals.length ? 'none' : 'inline';
+    select.style.display = goals.length ? 'block' : 'none';
+    restoreButton.disabled = goals.length === 0;
+    deleteButton.disabled = goals.length === 0;
+  } catch (error) {
+    alert('Не удалось загрузить архив: ' + error.message);
+  }
+}
+
+document.getElementById('archive-goal-btn').addEventListener('click', async () => {
+  if (!ACTIVE_SAVINGS_GOAL_ID) return;
+  const name = document.getElementById('goal-name-input').value.trim() || 'эту копилку';
+  const isLastActive = document.getElementById('goal-select').options.length <= 1;
+  let message = `Отправить копилку «${name}» в архив? Все суммы сохранятся, и копилку можно будет восстановить.`;
+  if (isLastActive) {
+    message += '\n\nЭто последняя активная копилка. После архивирования будет создана пустая копилка «Новая копилка» с той же целью и сроком.';
+  }
+  if (!confirm(message)) return;
+  try {
+    const result = await apiJson(`/api/savings/goals/${encodeURIComponent(ACTIVE_SAVINGS_GOAL_ID)}/archive`, {
+      method: 'POST', body: JSON.stringify({})
+    });
+    ACTIVE_SAVINGS_GOAL_ID = result.replacement_id || null;
+    await loadSavings();
+    const panel = document.getElementById('archive-panel');
+    if (panel.style.display !== 'none') await refreshArchivedGoals();
+    if (result.replacement_id) {
+      alert('Копилка отправлена в архив. Создана новая пустая копилка с прежней целью и сроком.');
+    }
+  } catch (error) {
+    alert('Не удалось отправить копилку в архив: ' + error.message);
+  }
+});
+
+document.getElementById('delete-goal-btn').addEventListener('click', async () => {
+  if (!ACTIVE_SAVINGS_GOAL_ID) return;
+  const name = document.getElementById('goal-name-input').value.trim() || 'эту копилку';
+  if (!confirm(`Окончательно удалить копилку «${name}» и все её суммы? Это действие нельзя отменить. Для сохранения данных используйте архив.`)) return;
+  try {
+    await apiJson(`/api/savings/goals/${encodeURIComponent(ACTIVE_SAVINGS_GOAL_ID)}`, {
+      method: 'DELETE'
+    });
+    ACTIVE_SAVINGS_GOAL_ID = null;
+    await loadSavings();
+  } catch (error) {
+    alert('Не удалось удалить копилку: ' + error.message);
+  }
+});
+
+document.getElementById('toggle-archive-btn').addEventListener('click', async () => {
+  const panel = document.getElementById('archive-panel');
+  if (panel.style.display === 'none') {
+    panel.style.display = 'flex';
+    await refreshArchivedGoals();
+  } else {
+    panel.style.display = 'none';
+  }
+});
+
+document.getElementById('restore-goal-btn').addEventListener('click', async () => {
+  const id = Number(document.getElementById('archived-goal-select').value);
+  if (!Number.isInteger(id) || id <= 0) return;
+  try {
+    await apiJson(`/api/savings/goals/${id}/restore`, {
+      method: 'POST', body: JSON.stringify({})
+    });
+    ACTIVE_SAVINGS_GOAL_ID = id;
+    await loadSavings();
+    await refreshArchivedGoals();
+  } catch (error) {
+    alert('Не удалось восстановить копилку: ' + error.message);
+  }
+});
+
+document.getElementById('delete-archived-goal-btn').addEventListener('click', async () => {
+  const select = document.getElementById('archived-goal-select');
+  const id = Number(select.value);
+  if (!Number.isInteger(id) || id <= 0) return;
+  const name = select.options[select.selectedIndex]?.textContent || 'эту архивную копилку';
+  if (!confirm(`Окончательно удалить «${name}» и все сохранённые суммы? Это действие нельзя отменить.`)) return;
+  try {
+    await apiJson(`/api/savings/goals/${id}`, { method: 'DELETE' });
+    await refreshArchivedGoals();
+  } catch (error) {
+    alert('Не удалось удалить архивную копилку: ' + error.message);
+  }
+});
 
 // --- Старт страницы ---
 const savedToken = localStorage.getItem('auth_token');
