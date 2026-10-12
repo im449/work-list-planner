@@ -132,6 +132,58 @@ def init_db():
         )
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_savings_goals_user ON savings_goals(user_id, archived, id)")
+
+    # Calendar metadata added additively; existing amounts/day indexes are untouched.
+    goal_cols = [r["name"] for r in c.execute("PRAGMA table_info(savings_goals)")]
+    if "start_date" not in goal_cols:
+        c.execute("ALTER TABLE savings_goals ADD COLUMN start_date TEXT")
+    goal_cols = [r["name"] for r in c.execute("PRAGMA table_info(savings_goals)")]
+    if "end_date" not in goal_cols:
+        c.execute("ALTER TABLE savings_goals ADD COLUMN end_date TEXT")
+    goal_cols = [r["name"] for r in c.execute("PRAGMA table_info(savings_goals)")]
+    if "created_date_known" not in goal_cols:
+        # Existing records cannot prove the original user-facing creation date.
+        c.execute("ALTER TABLE savings_goals ADD COLUMN created_date_known INTEGER NOT NULL DEFAULT 0")
+    goal_cols = [r["name"] for r in c.execute("PRAGMA table_info(savings_goals)")]
+    if "calendar_configured" not in goal_cols:
+        # Legacy goals get one opportunity to set a truthful calendar anchor.
+        c.execute("ALTER TABLE savings_goals ADD COLUMN calendar_configured INTEGER NOT NULL DEFAULT 0")
+
+    # For legacy goals use a sensible calendar period, but label their historical
+    # creation date as unknown instead of presenting the migration date as truth.
+    c.execute("""
+        UPDATE savings_goals
+        SET start_date = COALESCE(start_date, date('now')),
+            end_date = COALESCE(
+                end_date,
+                date(COALESCE(start_date, date('now')), printf('+%d days', days - 1))
+            )
+        WHERE start_date IS NULL OR end_date IS NULL
+    """)
+    c.execute("""
+        UPDATE savings_goals SET created_date_known = 1
+        WHERE id NOT IN (SELECT MIN(id) FROM savings_goals GROUP BY user_id)
+    """)
+
+    # New rows created by helper/automatic replacement code also receive dates.
+    # This trigger runs only on future inserts; it does not relabel old goals.
+    c.execute("""
+        CREATE TRIGGER IF NOT EXISTS trg_savings_goals_calendar_defaults
+        AFTER INSERT ON savings_goals
+        FOR EACH ROW
+        WHEN NEW.start_date IS NULL OR NEW.end_date IS NULL
+        BEGIN
+            UPDATE savings_goals
+            SET start_date = COALESCE(NEW.start_date, date('now')),
+                end_date = COALESCE(
+                    NEW.end_date,
+                    date(COALESCE(NEW.start_date, date('now')), printf('+%d days', NEW.days - 1))
+                ),
+                created_date_known = 1,
+                calendar_configured = 1
+            WHERE id = NEW.id;
+        END
+    """)
     c.execute("""
         CREATE TABLE IF NOT EXISTS savings_goal_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -646,7 +698,7 @@ async def generate_report(request: Request, current_user: dict = Depends(get_cur
 def _ensure_savings_goal(conn, user_id: int):
     """Return the user's first active goal, migrating their old single goal on first use."""
     row = conn.execute(
-        "SELECT id, user_id, name, goal, days FROM savings_goals "
+        "SELECT * FROM savings_goals "
         "WHERE user_id = ? AND archived = 0 ORDER BY id LIMIT 1",
         (user_id,)
     ).fetchone()
@@ -659,9 +711,12 @@ def _ensure_savings_goal(conn, user_id: int):
     ).fetchone()
     goal = float(legacy_settings["goal"]) if legacy_settings else 100000.0
     days = int(legacy_settings["days"]) if legacy_settings else 365
+    start_date = datetime.utcnow().date()
+    end_date = start_date + timedelta(days=days - 1)
     cursor = conn.execute(
-        "INSERT INTO savings_goals (user_id, name, goal, days) VALUES (?, ?, ?, ?)",
-        (user_id, "Моя копилка", goal, days)
+        "INSERT INTO savings_goals (user_id, name, goal, days, start_date, end_date, created_date_known, calendar_configured) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+        (user_id, "Моя копилка", goal, days, start_date.isoformat(), end_date.isoformat())
     )
     goal_id = cursor.lastrowid
     legacy_entries = conn.execute(
@@ -675,7 +730,7 @@ def _ensure_savings_goal(conn, user_id: int):
         )
     conn.commit()
     return conn.execute(
-        "SELECT id, user_id, name, goal, days FROM savings_goals WHERE id = ? AND user_id = ?",
+        "SELECT * FROM savings_goals WHERE id = ? AND user_id = ?",
         (goal_id, user_id)
     ).fetchone()
 
@@ -684,7 +739,7 @@ def _get_savings_goal(conn, user_id: int, goal_id: int | None = None):
     if goal_id is None:
         return _ensure_savings_goal(conn, user_id)
     row = conn.execute(
-        "SELECT id, user_id, name, goal, days FROM savings_goals "
+        "SELECT * FROM savings_goals "
         "WHERE id = ? AND user_id = ? AND archived = 0",
         (goal_id, user_id)
     ).fetchone()
@@ -711,12 +766,63 @@ def _parse_savings_goal(item: dict, current=None):
     return name, goal, days
 
 
+def _parse_savings_date_range(item: dict, current=None, requested_days: int = 365):
+    """Return (start_iso, end_iso, inclusive_days) with strict ISO calendar dates."""
+    default_start = (current["start_date"] if current is not None else None) or datetime.utcnow().date().isoformat()
+    raw_start = item.get("start_date") or default_start
+    raw_end = item.get("end_date")
+    try:
+        start = datetime.strptime(str(raw_start), "%Y-%m-%d").date()
+        if raw_end:
+            end = datetime.strptime(str(raw_end), "%Y-%m-%d").date()
+        else:
+            end = start + timedelta(days=int(requested_days) - 1)
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(status_code=400, detail="Укажите корректные даты начала и окончания")
+    duration = (end - start).days + 1
+    if duration < 1:
+        raise HTTPException(status_code=400, detail="Дата окончания не может быть раньше даты начала")
+    if duration > 3650:
+        raise HTTPException(status_code=400, detail="Период копилки не может превышать 3650 календарных дней")
+    return start.isoformat(), end.isoformat(), duration
+
+
+def _validate_savings_calendar_change(conn, goal_id: int, current, start_date: str, days: int):
+    saved_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM savings_goal_entries WHERE goal_id = ?",
+        (goal_id,)
+    ).fetchone()["n"]
+    if saved_count and bool(current["calendar_configured"]) and start_date != current["start_date"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Нельзя менять дату начала после сохранения записей: даты взносов сместились бы. Измените дату окончания."
+        )
+    last_entry = conn.execute(
+        "SELECT MAX(day) AS last_day FROM savings_goal_entries WHERE goal_id = ?",
+        (goal_id,)
+    ).fetchone()["last_day"]
+    if last_entry is not None and int(last_entry) > days:
+        raise HTTPException(
+            status_code=400,
+            detail=f"В выбранном диапазоне только {days} дней, но данные есть до дня {last_entry}. Выберите более позднюю дату окончания."
+        )
+
+
 def _goal_payload(row):
+    keys = set(row.keys()) if hasattr(row, "keys") else set()
+    def value(key, default=None):
+        return row[key] if key in keys else default
+
     return {
         "id": int(row["id"]),
         "name": row["name"],
         "goal": float(row["goal"]),
         "days": int(row["days"]),
+        "start_date": value("start_date"),
+        "end_date": value("end_date"),
+        "created_at": value("created_at"),
+        "created_date_known": bool(value("created_date_known", 0)),
+        "calendar_configured": bool(value("calendar_configured", 0)),
     }
 
 
@@ -732,7 +838,7 @@ async def get_savings_goals(
         if not archived:
             _ensure_savings_goal(conn, current_user["id"])
         rows = conn.execute(
-            "SELECT id, name, goal, days FROM savings_goals "
+            "SELECT id, name, goal, days, start_date, end_date, created_at, created_date_known FROM savings_goals "
             "WHERE user_id = ? AND archived = ? ORDER BY id",
             (current_user["id"], 1 if archived else 0)
         ).fetchall()
@@ -747,15 +853,17 @@ async def create_savings_goal(
     current_user: dict = Depends(get_current_user)
 ):
     name, goal, days = _parse_savings_goal(item)
+    start_date, end_date, days = _parse_savings_date_range(item, None, days)
     conn = db()
     try:
         cursor = conn.execute(
-            "INSERT INTO savings_goals (user_id, name, goal, days) VALUES (?, ?, ?, ?)",
-            (current_user["id"], name, goal, days)
+            "INSERT INTO savings_goals (user_id, name, goal, days, start_date, end_date, created_date_known, calendar_configured) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, 1)",
+            (current_user["id"], name, goal, days, start_date, end_date)
         )
         conn.commit()
         row = conn.execute(
-            "SELECT id, name, goal, days FROM savings_goals WHERE id = ? AND user_id = ?",
+            "SELECT * FROM savings_goals WHERE id = ? AND user_id = ?",
             (cursor.lastrowid, current_user["id"])
         ).fetchone()
         return _goal_payload(row)
@@ -773,13 +881,16 @@ async def rename_savings_goal(
     try:
         current = _get_savings_goal(conn, current_user["id"], goal_id)
         name, goal, days = _parse_savings_goal(item, current)
+        start_date, end_date, days = _parse_savings_date_range(item, current, days)
+        _validate_savings_calendar_change(conn, goal_id, current, start_date, days)
         conn.execute(
-            "UPDATE savings_goals SET name = ?, goal = ?, days = ? WHERE id = ? AND user_id = ?",
-            (name, goal, days, goal_id, current_user["id"])
+            "UPDATE savings_goals SET name = ?, goal = ?, days = ?, start_date = ?, end_date = ?, calendar_configured = 1 "
+            "WHERE id = ? AND user_id = ?",
+            (name, goal, days, start_date, end_date, goal_id, current_user["id"])
         )
         conn.commit()
         updated = conn.execute(
-            "SELECT id, name, goal, days FROM savings_goals WHERE id = ? AND user_id = ?",
+            "SELECT * FROM savings_goals WHERE id = ? AND user_id = ?",
             (goal_id, current_user["id"])
         ).fetchone()
         return _goal_payload(updated)
@@ -796,7 +907,7 @@ async def archive_savings_goal(
     conn = db()
     try:
         goal = conn.execute(
-            "SELECT id, name, goal, days FROM savings_goals "
+            "SELECT id, name, goal, days, start_date, end_date, created_at, created_date_known FROM savings_goals "
             "WHERE id = ? AND user_id = ? AND archived = 0",
             (goal_id, current_user["id"])
         ).fetchone()
@@ -832,7 +943,7 @@ async def restore_savings_goal(
     conn = db()
     try:
         goal = conn.execute(
-            "SELECT id, name, goal, days FROM savings_goals "
+            "SELECT id, name, goal, days, start_date, end_date, created_at, created_date_known FROM savings_goals "
             "WHERE id = ? AND user_id = ? AND archived = 1",
             (goal_id, current_user["id"])
         ).fetchone()
@@ -844,7 +955,7 @@ async def restore_savings_goal(
         )
         conn.commit()
         restored = conn.execute(
-            "SELECT id, name, goal, days FROM savings_goals WHERE id = ? AND user_id = ?",
+            "SELECT * FROM savings_goals WHERE id = ? AND user_id = ?",
             (goal_id, current_user["id"])
         ).fetchone()
         return _goal_payload(restored)
@@ -861,7 +972,7 @@ async def delete_savings_goal(
     conn = db()
     try:
         goal = conn.execute(
-            "SELECT id, archived FROM savings_goals WHERE id = ? AND user_id = ?",
+            "SELECT * FROM savings_goals WHERE id = ? AND user_id = ?",
             (goal_id, current_user["id"])
         ).fetchone()
         if not goal:
@@ -890,6 +1001,50 @@ async def delete_savings_goal(
         conn.close()
 
 
+@app.get("/api/savings/summary")
+async def get_savings_summary(current_user: dict = Depends(get_current_user)):
+    conn = db()
+    try:
+        rows = conn.execute("""
+            SELECT g.id, g.name, g.goal,
+                   COALESCE(SUM(CASE WHEN e.paid = 1 THEN e.amount ELSE 0 END), 0) AS saved
+            FROM savings_goals g
+            LEFT JOIN savings_goal_entries e ON e.goal_id = g.id
+            WHERE g.user_id = ? AND g.archived = 0
+            GROUP BY g.id, g.name, g.goal
+            ORDER BY g.id
+        """, (current_user["id"],)).fetchall()
+        goals = []
+        total_goal = 0.0
+        total_saved = 0.0
+        total_remaining = 0.0
+        completed_toward_goals = 0.0
+        for row in rows:
+            goal_amount = float(row["goal"] or 0)
+            saved = round(float(row["saved"] or 0), 2)
+            remaining = round(max(0.0, goal_amount - saved), 2)
+            progress = min(100.0, saved / goal_amount * 100.0) if goal_amount > 0 else 0.0
+            total_goal += goal_amount
+            total_saved += saved
+            total_remaining += remaining
+            completed_toward_goals += min(saved, goal_amount)
+            goals.append({
+                "id": int(row["id"]), "name": row["name"],
+                "goal": round(goal_amount, 2), "saved": saved,
+                "remaining": remaining, "progress_percent": round(progress, 1)
+            })
+        return {
+            "active_count": len(goals),
+            "total_goal": round(total_goal, 2),
+            "total_saved": round(total_saved, 2),
+            "total_remaining": round(total_remaining, 2),
+            "progress_percent": round(min(100.0, completed_toward_goals / total_goal * 100.0), 1) if total_goal > 0 else 0.0,
+            "goals": goals,
+        }
+    finally:
+        conn.close()
+
+
 @app.get("/api/savings/settings")
 async def get_savings_settings(
     goal_id: int | None = None,
@@ -898,7 +1053,12 @@ async def get_savings_settings(
     conn = db()
     try:
         row = _get_savings_goal(conn, current_user["id"], goal_id)
-        return _goal_payload(row)
+        payload = _goal_payload(row)
+        payload["has_entries"] = bool(conn.execute(
+            "SELECT COUNT(*) AS n FROM savings_goal_entries WHERE goal_id = ?",
+            (row["id"],)
+        ).fetchone()["n"])
+        return payload
     finally:
         conn.close()
 
@@ -913,9 +1073,12 @@ async def update_savings_settings(
     try:
         current = _get_savings_goal(conn, current_user["id"], goal_id)
         name, goal, days = _parse_savings_goal(item, current)
+        start_date, end_date, days = _parse_savings_date_range(item, current, days)
+        _validate_savings_calendar_change(conn, int(current["id"]), current, start_date, days)
         conn.execute(
-            "UPDATE savings_goals SET name = ?, goal = ?, days = ? WHERE id = ? AND user_id = ?",
-            (name, goal, days, current["id"], current_user["id"])
+            "UPDATE savings_goals SET name = ?, goal = ?, days = ?, start_date = ?, end_date = ?, calendar_configured = 1 "
+            "WHERE id = ? AND user_id = ?",
+            (name, goal, days, start_date, end_date, current["id"], current_user["id"])
         )
         conn.commit()
         return {"id": int(current["id"]), "name": name, "goal": goal, "days": days}

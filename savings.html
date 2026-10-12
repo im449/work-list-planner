@@ -57,6 +57,18 @@
     </div>
   </div>
 
+  <div class="stats-block" id="savings-summary-block">
+    <h3>Все активные копилки</h3>
+    <div style="display:flex;gap:20px;flex-wrap:wrap;margin:12px 0;">
+      <div>Сумма целей: <b id="summary-goal-total">0 ₽</b></div>
+      <div>Накоплено: <b id="summary-saved-total">0 ₽</b></div>
+      <div>Осталось: <b id="summary-remaining-total">0 ₽</b></div>
+      <div>Прогресс: <b id="summary-progress-percent">0%</b></div>
+    </div>
+    <div class="progress-bar-bg"><div class="progress-bar-fill" id="summary-progress-fill" style="width:0%"></div></div>
+    <div id="summary-goals" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:14px;"></div>
+  </div>
+
   <div class="stats-block">
     <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:end; margin:12px 0 18px;">
       <label>Выбранная копилка
@@ -85,13 +97,24 @@
         <input id="goal-input" type="number" min="1" step="0.01" value="100000"
           style="display:block; width:180px; padding:8px; margin-top:4px;">
       </label>
-      <label>Срок, дней
-        <input id="days-input" type="number" min="1" max="3650" step="1" value="365"
-          style="display:block; width:140px; padding:8px; margin-top:4px;">
+      <label>Начало накоплений
+        <input id="start-date-input" type="date" required
+          style="display:block; width:175px; padding:8px; margin-top:4px;">
+      </label>
+      <label>Дата достижения цели
+        <input id="end-date-input" type="date" required
+          style="display:block; width:190px; padding:8px; margin-top:4px;">
+      </label>
+      <label>Календарных дней
+        <input id="days-input" type="number" min="1" max="3650" step="1" value="365" readonly
+          title="Рассчитывается по датам начала и окончания"
+          style="display:block; width:140px; padding:8px; margin-top:4px;background:#f5f5f5;">
       </label>
       <button id="settings-save" type="button"
         style="align-self:end; padding:9px 14px; cursor:pointer;">Сохранить цель</button>
     </div>
+    <p id="created-date-label" style="font-size:13px;color:#666;margin:4px 0;"></p>
+    <p id="start-date-hint" style="font-size:13px;color:#666;margin:4px 0;"></p>
     <div style="margin:10px 0;">
       Накоплено: <b id="total-sum">0 ₽</b> |
       Осталось: <b id="remaining-sum">100 000 ₽</b>
@@ -211,6 +234,50 @@ function formatMoney(value) {
   }) + ' ₽';
 }
 
+function todayISODate() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+}
+
+function addDaysISO(iso, offset) {
+  const parts = String(iso).split('-').map(Number);
+  const dt = new Date(Date.UTC(parts[0], parts[1] - 1, parts[2] + offset));
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+}
+
+function addCalendarYearISO(iso) {
+  const parts = String(iso).split('-').map(Number);
+  const targetYear = parts[0] + 1;
+  const lastDay = new Date(Date.UTC(targetYear, parts[1], 0)).getUTCDate();
+  const day = Math.min(parts[2], lastDay);
+  return `${targetYear}-${String(parts[1]).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function calendarDaysInclusive(start, end) {
+  if (!start || !end) return 0;
+  const a = Date.parse(`${start}T00:00:00Z`);
+  const b = Date.parse(`${end}T00:00:00Z`);
+  return Number.isFinite(a) && Number.isFinite(b) ? Math.floor((b - a) / 86400000) + 1 : 0;
+}
+
+function updateCalendarDaysPreview() {
+  const start = document.getElementById('start-date-input').value;
+  const end = document.getElementById('end-date-input').value;
+  const days = calendarDaysInclusive(start, end);
+  document.getElementById('days-input').value = days > 0 ? days : '';
+}
+
+function savingsDateForDay(day) {
+  const start = document.getElementById('start-date-input').value;
+  if (!start) return { short: `День ${day}`, full: `День ${day}` };
+  const parts = start.split('-').map(Number);
+  const date = new Date(parts[0], parts[1] - 1, parts[2] + day - 1, 12, 0, 0);
+  return {
+    short: date.toLocaleDateString('ru-RU', { day: '2-digit', month: 'short' }).replace('.', ''),
+    full: date.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' })
+  };
+}
+
 async function apiJson(url, options = {}) {
   const response = await fetch(url, {
     ...options,
@@ -242,7 +309,9 @@ async function saveSaving(day, amount, paid) {
 async function saveSavingsSettings() {
   const name = document.getElementById('goal-name-input').value.trim();
   const goal = Number(document.getElementById('goal-input').value);
-  const days = Number(document.getElementById('days-input').value);
+  const start_date = document.getElementById('start-date-input').value;
+  const end_date = document.getElementById('end-date-input').value;
+  const days = calendarDaysInclusive(start_date, end_date);
 
   if (!name || name.length > 80) {
     alert('Введите название копилки длиной от 1 до 80 символов.');
@@ -252,15 +321,15 @@ async function saveSavingsSettings() {
     alert('Укажите цель больше нуля.');
     return;
   }
-  if (!Number.isInteger(days) || days < 1 || days > 3650) {
-    alert('Укажите срок от 1 до 3650 дней.');
+  if (!start_date || !end_date || end_date < start_date || !Number.isInteger(days) || days < 1 || days > 3650) {
+    alert('Выберите корректные даты начала и окончания (от 1 до 3650 календарных дней).');
     return;
   }
 
   try {
     await apiJson(`/api/savings/settings?goal_id=${encodeURIComponent(ACTIVE_SAVINGS_GOAL_ID)}`, {
       method: 'PUT',
-      body: JSON.stringify({ name, goal, days })
+      body: JSON.stringify({ name, goal, days, start_date, end_date })
     });
     await loadSavings();
   } catch (error) {
@@ -293,7 +362,20 @@ async function loadSavings() {
     document.getElementById('goal-name-input').value = settings.name || 'Моя копилка';
 
     document.getElementById('goal-input').value = SAVINGS_GOAL;
+    document.getElementById('start-date-input').value = settings.start_date || todayISODate();
+    document.getElementById('end-date-input').value = settings.end_date || addDaysISO(todayISODate(), SAVINGS_DAYS - 1);
+    document.getElementById('start-date-input').disabled = Boolean(settings.has_entries && settings.calendar_configured);
+    document.getElementById('start-date-hint').innerText = settings.has_entries && settings.calendar_configured
+      ? 'Дата начала зафиксирована, чтобы сохранённые взносы не смещались. Переносите дату окончания.'
+      : settings.has_entries
+        ? 'Для старой копилки укажите правильную начальную дату один раз. После сохранения даты существующих сумм будут показаны по календарю.'
+        : 'Дата начала станет фиксированной после сохранения взносов.';
+    document.getElementById('created-date-label').innerText = settings.created_date_known && settings.created_at
+      ? 'Создана в приложении: ' + String(settings.created_at).slice(0, 10).split('-').reverse().join('.')
+      : 'Историческая дата создания этой копилки в прежней версии не сохранялась.';
     document.getElementById('days-input').value = SAVINGS_DAYS;
+    updateCalendarDaysPreview();
+    document.getElementById('end-date-input').min = document.getElementById('start-date-input').value;
     document.getElementById('days-total').innerText = SAVINGS_DAYS;
 
     const items = await apiJson(`/api/savings?goal_id=${encodeURIComponent(ACTIVE_SAVINGS_GOAL_ID)}`);
@@ -349,11 +431,12 @@ async function loadSavings() {
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'cell-main';
-      button.title = `День ${d}. Нажмите, чтобы ввести фактический взнос.`;
+      const cellDate = savingsDateForDay(d);
+      button.title = `${cellDate.full} (день ${d}). Нажмите, чтобы ввести фактический взнос.`;
 
       const dayLabel = document.createElement('span');
       dayLabel.className = 'cell-day';
-      dayLabel.innerText = `День ${d}`;
+      dayLabel.innerText = cellDate.short;
 
       const amountLabel = document.createElement('span');
       amountLabel.className = 'cell-amount';
@@ -363,7 +446,7 @@ async function loadSavings() {
       button.addEventListener('click', async () => {
         const initial = item.paid ? String(item.amount) : '';
         const answer = prompt(
-          `День ${d}. Введите фактически отложенную сумму в рублях.\n` +
+          `${cellDate.full} (день ${d}). Введите фактически отложенную сумму в рублях.\n` +
           'Ноль снимает отметку, ранее введённая сумма при этом сохраняется.',
           initial
         );
@@ -388,13 +471,60 @@ async function loadSavings() {
       cell.appendChild(button);
       grid.appendChild(cell);
     }
+    await loadSavingsSummary();
   } catch (error) {
     console.error(error);
     alert('Ошибка: ' + error.message);
   }
 }
 
+async function loadSavingsSummary() {
+  try {
+    const summary = await apiJson('/api/savings/summary');
+    document.getElementById('summary-goal-total').innerText = formatMoney(summary.total_goal);
+    document.getElementById('summary-saved-total').innerText = formatMoney(summary.total_saved);
+    document.getElementById('summary-remaining-total').innerText = formatMoney(summary.total_remaining);
+    document.getElementById('summary-progress-percent').innerText = `${summary.progress_percent || 0}%`;
+    document.getElementById('summary-progress-fill').style.width = `${Math.max(0, Math.min(100, Number(summary.progress_percent) || 0))}%`;
+
+    const container = document.getElementById('summary-goals');
+    container.innerHTML = '';
+    (summary.goals || []).forEach(goal => {
+      const card = document.createElement('div');
+      card.style.cssText = 'border:1px solid #ddd;border-radius:8px;padding:10px;min-width:0;';
+      const name = document.createElement('strong');
+      name.textContent = goal.name;
+      const values = document.createElement('div');
+      values.style.cssText = 'font-size:13px;margin:6px 0;';
+      values.textContent = `${formatMoney(goal.saved)} из ${formatMoney(goal.goal)} · осталось ${formatMoney(goal.remaining)}`;
+      const track = document.createElement('div');
+      track.className = 'progress-bar-bg';
+      const fill = document.createElement('div');
+      fill.className = 'progress-bar-fill';
+      fill.style.width = `${Math.max(0, Math.min(100, Number(goal.progress_percent) || 0))}%`;
+      track.appendChild(fill);
+      const pct = document.createElement('div');
+      pct.style.cssText = 'font-size:12px;color:#666;margin-top:4px;';
+      pct.textContent = `${goal.progress_percent || 0}%`;
+      card.append(name, values, track, pct);
+      container.appendChild(card);
+    });
+    if (!summary.goals || summary.goals.length === 0) {
+      container.textContent = 'Нет активных копилок.';
+    }
+  } catch (error) {
+    console.error('Не удалось загрузить сводку накоплений:', error);
+  }
+}
+
 document.getElementById('settings-save').addEventListener('click', saveSavingsSettings);
+document.getElementById('start-date-input').addEventListener('change', () => {
+  const start = document.getElementById('start-date-input').value;
+  document.getElementById('end-date-input').min = start;
+  if (document.getElementById('end-date-input').value < start) document.getElementById('end-date-input').value = start;
+  updateCalendarDaysPreview();
+});
+document.getElementById('end-date-input').addEventListener('change', updateCalendarDaysPreview);
 
 document.getElementById('goal-select').addEventListener('change', async (event) => {
   const nextId = Number(event.target.value);
@@ -411,9 +541,11 @@ document.getElementById('new-goal-btn').addEventListener('click', async () => {
     return;
   }
   try {
+    const newStart = todayISODate();
+    const newEnd = addCalendarYearISO(newStart);
     const created = await apiJson('/api/savings/goals', {
       method: 'POST',
-      body: JSON.stringify({ name: name.trim(), goal: 100000, days: 365 })
+      body: JSON.stringify({ name: name.trim(), goal: 100000, days: 365, start_date: newStart, end_date: newEnd })
     });
     ACTIVE_SAVINGS_GOAL_ID = Number(created.id);
     await loadSavings();
