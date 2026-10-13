@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fpdf import FPDF
 import os
+import math
 import sqlite3
 from dotenv import load_dotenv
 load_dotenv()
@@ -1127,6 +1128,8 @@ async def update_saving(
     try:
         amount = float(item.get("amount", 0))
     except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Некорректная сумма")
+    if not math.isfinite(amount):
         raise HTTPException(status_code=400, detail="Некорректная сумма")
     if amount < 0:
         raise HTTPException(status_code=400, detail="Сумма не может быть отрицательной")

@@ -257,3 +257,233 @@ def test_cannot_delete_last_active_savings_goal():
         headers=headers,
     )
     assert last.status_code == 400
+
+
+def test_savings_goal_rejects_invalid_parameters():
+    headers = register_and_login("savings_bad_params_test")
+
+    invalid_payloads = [
+        {"name": "Нулевая цель", "goal": 0, "days": 3},
+        {"name": "Отрицательная цель", "goal": -1, "days": 3},
+        {"name": "Слишком большая цель", "goal": 1000000000001, "days": 3},
+        {"name": "Нулевой срок", "goal": 1000, "days": 0},
+        {"name": "Слишком большой срок", "goal": 1000, "days": 3651},
+        {"name": "   ", "goal": 1000, "days": 3},
+    ]
+
+    for payload in invalid_payloads:
+        response = client.post(
+            "/api/savings/goals",
+            json=payload,
+            headers=headers,
+        )
+        assert response.status_code == 400, (
+            f"Ожидался HTTP 400 для {payload}, "
+            f"получено {response.status_code}: {response.text}"
+        )
+
+
+def test_savings_goal_rejects_invalid_date_ranges():
+    headers = register_and_login("savings_bad_dates_test")
+
+    invalid_payloads = [
+        {
+            "name": "Несуществующая дата",
+            "goal": 1000,
+            "days": 3,
+            "start_date": "2026-02-30",
+            "end_date": "2026-03-04",
+        },
+        {
+            "name": "Обратный период",
+            "goal": 1000,
+            "days": 3,
+            "start_date": "2026-01-03",
+            "end_date": "2026-01-01",
+        },
+        {
+            "name": "Слишком длинный период",
+            "goal": 1000,
+            "days": 3,
+            "start_date": "2020-01-01",
+            "end_date": "2030-01-01",
+        },
+    ]
+
+    for payload in invalid_payloads:
+        response = client.post(
+            "/api/savings/goals",
+            json=payload,
+            headers=headers,
+        )
+        assert response.status_code == 400, (
+            f"Ожидался HTTP 400 для {payload}, "
+            f"получено {response.status_code}: {response.text}"
+        )
+
+
+def test_savings_calendar_rejects_out_of_range_days():
+    headers = register_and_login("savings_bad_day_test")
+    created = create_goal(headers)
+    assert created.status_code == 200, created.text
+    goal_id = created.json()["id"]
+
+    for day in (0, 4, 3651):
+        response = client.put(
+            f"/api/savings/{day}?goal_id={goal_id}",
+            json={"amount": 10, "paid": True},
+            headers=headers,
+        )
+        assert response.status_code == 400, (
+            f"День {day}: ожидался HTTP 400, "
+            f"получено {response.status_code}: {response.text}"
+        )
+
+
+def test_savings_calendar_rejects_non_finite_amounts():
+    headers = register_and_login("savings_nonfinite_test")
+    created = create_goal(headers)
+    assert created.status_code == 200, created.text
+    goal_id = created.json()["id"]
+
+    for amount in ("NaN", "Infinity", "-Infinity"):
+        payload = (
+            '{"amount": ' + amount + ', "paid": true}'
+        )
+        response = client.put(
+            f"/api/savings/1?goal_id={goal_id}",
+            content=payload,
+            headers={**headers, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 400, (
+            f"Сумма {amount}: ожидался HTTP 400, "
+            f"получено {response.status_code}: {response.text}"
+        )
+
+
+def test_savings_calendar_cannot_shrink_below_saved_days():
+    headers = register_and_login("savings_shrink_calendar_test")
+    created = create_goal(headers)
+    assert created.status_code == 200, created.text
+    goal_id = created.json()["id"]
+
+    saved = client.put(
+        f"/api/savings/3?goal_id={goal_id}",
+        json={"amount": 300, "paid": True},
+        headers=headers,
+    )
+    assert saved.status_code == 200, saved.text
+
+    response = client.put(
+        f"/api/savings/goals/{goal_id}",
+        json={
+            "name": "Тестовая цель",
+            "goal": 1000,
+            "days": 2,
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-02",
+        },
+        headers=headers,
+    )
+    assert response.status_code == 400, response.text
+
+    calendar = client.get(
+        f"/api/savings?goal_id={goal_id}",
+        headers=headers,
+    )
+    assert calendar.status_code == 200, calendar.text
+    assert len(calendar.json()) == 3
+    assert calendar.json()[2]["amount"] == 300
+
+
+def test_savings_goal_is_private_for_calendar_archive_and_delete():
+    owner_headers = register_and_login("savings_private_owner_test")
+    other_headers = register_and_login("savings_private_other_test")
+
+    created = create_goal(owner_headers, "Чужая цель")
+    assert created.status_code == 200, created.text
+    goal_id = created.json()["id"]
+
+    # Чужой пользователь не может прочитать календарь или настройки.
+    response = client.get(
+        f"/api/savings?goal_id={goal_id}",
+        headers=other_headers,
+    )
+    assert response.status_code == 404
+
+    response = client.get(
+        f"/api/savings/settings?goal_id={goal_id}",
+        headers=other_headers,
+    )
+    assert response.status_code == 404
+
+    # Нельзя записать данные в чужую цель.
+    response = client.put(
+        f"/api/savings/1?goal_id={goal_id}",
+        json={"amount": 999, "paid": True},
+        headers=other_headers,
+    )
+    assert response.status_code == 404
+
+    # Нельзя архивировать или удалить чужую цель.
+    response = client.post(
+        f"/api/savings/goals/{goal_id}/archive",
+        headers=other_headers,
+    )
+    assert response.status_code == 404
+
+    response = client.delete(
+        f"/api/savings/goals/{goal_id}",
+        headers=other_headers,
+    )
+    assert response.status_code == 404
+
+    # Проверяем, что владелец по-прежнему видит исходные данные.
+    calendar = client.get(
+        f"/api/savings?goal_id={goal_id}",
+        headers=owner_headers,
+    )
+    assert calendar.status_code == 200, calendar.text
+    assert calendar.json()[0]["amount"] == 0
+    assert calendar.json()[0]["paid"] is False
+
+
+def test_archiving_goal_preserves_saved_entries():
+    headers = register_and_login("savings_archive_data_test")
+    created = create_goal(headers, "Цель с данными")
+    assert created.status_code == 200, created.text
+    goal_id = created.json()["id"]
+
+    saved = client.put(
+        f"/api/savings/2?goal_id={goal_id}",
+        json={"amount": 250, "paid": True},
+        headers=headers,
+    )
+    assert saved.status_code == 200, saved.text
+
+    archived = client.post(
+        f"/api/savings/goals/{goal_id}/archive",
+        headers=headers,
+    )
+    assert archived.status_code == 200, archived.text
+
+    archived_list = client.get(
+        "/api/savings/goals?archived=true",
+        headers=headers,
+    )
+    assert archived_list.status_code == 200, archived_list.text
+    assert any(item["id"] == goal_id for item in archived_list.json())
+
+    restored = client.post(
+        f"/api/savings/goals/{goal_id}/restore",
+        headers=headers,
+    )
+    assert restored.status_code == 200, restored.text
+
+    calendar = client.get(
+        f"/api/savings?goal_id={goal_id}",
+        headers=headers,
+    )
+    assert calendar.status_code == 200, calendar.text
+    assert calendar.json()[1]["amount"] == 250
+    assert calendar.json()[1]["paid"] is True
