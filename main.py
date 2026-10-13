@@ -1161,4 +1161,4 @@ async def health():
 
 @app.get("/version")
 async def version():
-    return {"version": "1.0.0", "build": "2026-10-09"}
+    return {"version": "2.0.0", "build": "2026-10-13"}
