@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Literal
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -12,7 +12,7 @@ import math
 import sqlite3
 from dotenv import load_dotenv
 load_dotenv()
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 
@@ -198,6 +198,29 @@ def init_db():
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_savings_goal_entries_goal ON savings_goal_entries(goal_id, day)")
 
+    # === ГОДОВОЙ БЮДЖЕТ ===
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS budget_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            amount_kopecks INTEGER NOT NULL CHECK (amount_kopecks > 0),
+            item_type TEXT NOT NULL CHECK (item_type IN ('income', 'expense')),
+            category TEXT NOT NULL DEFAULT 'Без категории',
+            due_date TEXT NOT NULL,
+            mandatory INTEGER NOT NULL DEFAULT 0 CHECK (mandatory IN (0, 1)),
+            status TEXT NOT NULL DEFAULT 'planned'
+                CHECK (status IN ('planned', 'paid')),
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    c.execute("""
+        CREATE INDEX IF NOT EXISTS idx_budget_items_user_date
+        ON budget_items(user_id, due_date, id)
+    """)
+
     conn.commit()
     conn.close()
 
@@ -336,6 +359,14 @@ async def root():
 @app.get("/savings.html")
 async def savings_page():
     file_path = os.path.join(os.path.dirname(__file__), "savings.html")
+    with open(file_path, "r", encoding="utf-8") as f:
+        html_content = f.read()
+    return Response(content=html_content, media_type="text/html")
+
+
+@app.get("/budget.html")
+async def budget_page():
+    file_path = os.path.join(os.path.dirname(__file__), "budget.html")
     with open(file_path, "r", encoding="utf-8") as f:
         html_content = f.read()
     return Response(content=html_content, media_type="text/html")
@@ -1150,6 +1181,313 @@ async def update_saving(
         )
         conn.commit()
         return {"goal_id": int(goal["id"]), "day": day, "amount": amount, "paid": bool(paid)}
+    finally:
+        conn.close()
+
+
+
+# === ГОДОВОЙ БЮДЖЕТ: МОДЕЛИ И API ===
+
+class BudgetItemCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    amount_kopecks: int = Field(..., gt=0, le=100_000_000_000)
+    item_type: Literal["income", "expense"]
+    category: str = Field(default="Без категории", min_length=1, max_length=100)
+    due_date: date
+    mandatory: bool = False
+    status: Literal["planned", "paid"] = "planned"
+    notes: str = Field(default="", max_length=2000)
+    repeat_monthly: bool = False
+
+
+class BudgetItemUpdate(BaseModel):
+    title: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    amount_kopecks: Optional[int] = Field(
+        default=None, gt=0, le=100_000_000_000
+    )
+    item_type: Optional[Literal["income", "expense"]] = None
+    category: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    due_date: Optional[date] = None
+    mandatory: Optional[bool] = None
+    status: Optional[Literal["planned", "paid"]] = None
+    notes: Optional[str] = Field(default=None, max_length=2000)
+
+
+def _budget_item_dict(row):
+    result = dict(row)
+    result["mandatory"] = bool(result["mandatory"])
+    return result
+
+
+@app.get("/api/budget/items")
+async def list_budget_items(
+    year: int | None = None,
+    current_user: dict = Depends(get_current_user),
+):
+    if year is None:
+        year = date.today().year
+    if year < 1900 or year > 2200:
+        raise HTTPException(status_code=400, detail="Некорректный год")
+
+    start = f"{year:04d}-01-01"
+    end = f"{year + 1:04d}-01-01"
+
+    conn = db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, user_id, title, amount_kopecks, item_type,
+                   category, due_date, mandatory, status, notes,
+                   created_at, updated_at
+            FROM budget_items
+            WHERE user_id = ? AND due_date >= ? AND due_date < ?
+            ORDER BY due_date, id
+            """,
+            (current_user["id"], start, end),
+        ).fetchall()
+        return [_budget_item_dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+@app.post("/api/budget/items")
+async def create_budget_item(
+    item: BudgetItemCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    title = item.title.strip()
+    category = item.category.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="Название не может быть пустым")
+    if not category:
+        raise HTTPException(status_code=422, detail="Категория не может быть пустой")
+
+    conn = db()
+    try:
+        created_ids = []
+        months = range(1, 13) if item.repeat_monthly else [item.due_date.month]
+
+        for month in months:
+            if item.repeat_monthly:
+                last_day = __import__("calendar").monthrange(
+                    item.due_date.year, month
+                )[1]
+                day = min(item.due_date.day, last_day)
+                operation_date = date(item.due_date.year, month, day)
+                operation_status = "planned"
+            else:
+                operation_date = item.due_date
+                operation_status = item.status
+
+            cursor = conn.execute(
+                """
+                INSERT INTO budget_items
+                    (user_id, title, amount_kopecks, item_type, category,
+                     due_date, mandatory, status, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    current_user["id"],
+                    title,
+                    item.amount_kopecks,
+                    item.item_type,
+                    category,
+                    operation_date.isoformat(),
+                    int(item.mandatory),
+                    operation_status,
+                    item.notes,
+                ),
+            )
+            created_ids.append(cursor.lastrowid)
+
+        conn.commit()
+
+        placeholders = ",".join("?" for _ in created_ids)
+        rows = conn.execute(
+            f"""
+            SELECT id, user_id, title, amount_kopecks, item_type,
+                   category, due_date, mandatory, status, notes,
+                   created_at, updated_at
+            FROM budget_items
+            WHERE user_id = ? AND id IN ({placeholders})
+            ORDER BY due_date, id
+            """,
+            [current_user["id"], *created_ids],
+        ).fetchall()
+
+        created_items = [_budget_item_dict(row) for row in rows]
+        if item.repeat_monthly:
+            return {
+                "repeat_monthly": True,
+                "created_count": len(created_items),
+                "items": created_items,
+            }
+        return created_items[0]
+    finally:
+        conn.close()
+
+
+@app.put("/api/budget/items/{item_id}")
+async def update_budget_item(
+    item_id: int,
+    item: BudgetItemUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+    changes = item.dict(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=400, detail="Нет данных для изменения")
+
+    if any(value is None for value in changes.values()):
+        raise HTTPException(
+            status_code=422,
+            detail="Поля операции не могут иметь значение null",
+        )
+
+    if "title" in changes:
+        changes["title"] = changes["title"].strip()
+        if not changes["title"]:
+            raise HTTPException(
+                status_code=422,
+                detail="Название не может быть пустым",
+            )
+    if "category" in changes:
+        changes["category"] = changes["category"].strip()
+        if not changes["category"]:
+            raise HTTPException(
+                status_code=422,
+                detail="Категория не может быть пустой",
+            )
+    if "due_date" in changes and changes["due_date"] is not None:
+        changes["due_date"] = changes["due_date"].isoformat()
+    if "mandatory" in changes and changes["mandatory"] is not None:
+        changes["mandatory"] = int(changes["mandatory"])
+
+    allowed_fields = {
+        "title", "amount_kopecks", "item_type", "category",
+        "due_date", "mandatory", "status", "notes",
+    }
+    if not set(changes).issubset(allowed_fields):
+        raise HTTPException(status_code=400, detail="Недопустимые поля")
+
+    conn = db()
+    try:
+        existing = conn.execute(
+            "SELECT id FROM budget_items WHERE id = ? AND user_id = ?",
+            (item_id, current_user["id"]),
+        ).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Операция не найдена")
+
+        assignments = ", ".join(f"{field} = ?" for field in changes)
+        values = list(changes.values())
+        values.extend([datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), item_id, current_user["id"]])
+
+        conn.execute(
+            f"UPDATE budget_items SET {assignments}, updated_at = ? "
+            "WHERE id = ? AND user_id = ?",
+            values,
+        )
+        conn.commit()
+
+        row = conn.execute(
+            """
+            SELECT id, user_id, title, amount_kopecks, item_type,
+                   category, due_date, mandatory, status, notes,
+                   created_at, updated_at
+            FROM budget_items
+            WHERE id = ? AND user_id = ?
+            """,
+            (item_id, current_user["id"]),
+        ).fetchone()
+        return _budget_item_dict(row)
+    finally:
+        conn.close()
+
+
+@app.delete("/api/budget/items/{item_id}")
+async def delete_budget_item(
+    item_id: int,
+    current_user: dict = Depends(get_current_user),
+):
+    conn = db()
+    try:
+        cursor = conn.execute(
+            "DELETE FROM budget_items WHERE id = ? AND user_id = ?",
+            (item_id, current_user["id"]),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Операция не найдена")
+        conn.commit()
+        return {"status": "ok", "id": item_id}
+    finally:
+        conn.close()
+
+
+
+@app.get("/api/budget/summary")
+async def budget_summary(
+    year: int | None = None,
+    current_user: dict = Depends(get_current_user),
+):
+    if year is None:
+        year = date.today().year
+    if year < 1900 or year > 2200:
+        raise HTTPException(status_code=400, detail="Некорректный год")
+
+    start = f"{year:04d}-01-01"
+    end = f"{year + 1:04d}-01-01"
+
+    conn = db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                CAST(strftime('%m', due_date) AS INTEGER) AS month,
+                COALESCE(SUM(
+                    CASE WHEN item_type = 'income'
+                    THEN amount_kopecks ELSE 0 END
+                ), 0) AS income_kopecks,
+                COALESCE(SUM(
+                    CASE WHEN item_type = 'expense'
+                    THEN amount_kopecks ELSE 0 END
+                ), 0) AS expense_kopecks,
+                COALESCE(SUM(
+                    CASE WHEN item_type = 'expense' AND status = 'paid'
+                    THEN amount_kopecks ELSE 0 END
+                ), 0) AS paid_expense_kopecks,
+                COALESCE(SUM(
+                    CASE WHEN item_type = 'expense' AND mandatory = 1
+                    THEN amount_kopecks ELSE 0 END
+                ), 0) AS mandatory_expense_kopecks
+            FROM budget_items
+            WHERE user_id = ? AND due_date >= ? AND due_date < ?
+            GROUP BY strftime('%m', due_date)
+            """,
+            (current_user["id"], start, end),
+        ).fetchall()
+
+        by_month = {row["month"]: dict(row) for row in rows}
+        months = []
+
+        for month in range(1, 13):
+            row = by_month.get(month, {})
+            income = int(row.get("income_kopecks", 0))
+            expense = int(row.get("expense_kopecks", 0))
+
+            months.append({
+                "month": month,
+                "income_kopecks": income,
+                "expense_kopecks": expense,
+                "balance_kopecks": income - expense,
+                "paid_expense_kopecks": int(
+                    row.get("paid_expense_kopecks", 0)
+                ),
+                "mandatory_expense_kopecks": int(
+                    row.get("mandatory_expense_kopecks", 0)
+                ),
+            })
+
+        return {"year": year, "months": months}
     finally:
         conn.close()
 

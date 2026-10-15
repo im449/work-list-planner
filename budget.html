@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Годовой бюджет — Planner</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:16px;font-family:Arial,sans-serif;background:#f0f2f5;color:#263238}
+button,input,select,textarea{font:inherit}
+button{cursor:pointer;border:0;border-radius:6px;padding:9px 13px;background:#2563eb;color:white}
+button:disabled{opacity:.55;cursor:wait}
+input,select,textarea{padding:9px;border:1px solid #cbd5e1;border-radius:6px;background:white;max-width:100%;width:100%}
+label{display:flex;flex-direction:column;gap:5px;font-size:13px;color:#475569}
+.topbar{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px}
+.topbar h1{font-size:25px;margin:0}
+.nav{display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:13px}
+.nav a{color:#2563eb;text-decoration:none}
+.panel{background:white;border-radius:10px;padding:16px;margin-bottom:16px;box-shadow:0 2px 6px #0000000c}
+.panel h2{font-size:18px;margin:0 0 14px}
+.toolbar{display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-bottom:14px}
+.year-field{width:130px}
+.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.stat{padding:14px;border-radius:8px;background:#f8fafc;border:1px solid #e2e8f0;min-width:0}
+.stat span{display:block;font-size:12px;color:#64748b;margin-bottom:7px}
+.stat strong{font-size:clamp(16px,2.3vw,23px);overflow-wrap:anywhere}
+.income{color:#15803d}.expense{color:#b91c1c}.balance-positive{color:#15803d}.balance-negative{color:#b91c1c}
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px;min-width:650px}
+th,td{text-align:right;padding:10px 9px;border-bottom:1px solid #e2e8f0;white-space:nowrap}
+th{background:#f8fafc;color:#475569;font-weight:600}
+th:first-child,td:first-child{text-align:left}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:#f8fafc}
+tbody tr.selected{background:#eff6ff}
+.month-name{font-weight:600}
+.muted{color:#64748b;font-size:13px}
+.form-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.form-grid .wide{grid-column:span 2}
+.check-row{display:flex;align-items:center;gap:8px;flex-direction:row;padding-top:23px}
+.check-row input{width:auto}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.secondary{background:#e2e8f0;color:#1e293b}
+.danger{background:#dc2626}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}
+.payment{background:white;border:1px solid #e2e8f0;border-radius:9px;padding:14px;min-width:0}
+.payment-top{display:flex;justify-content:space-between;gap:8px;align-items:start}
+.payment h3{font-size:15px;margin:0 0 7px;overflow-wrap:anywhere}
+.amount{font-weight:700;font-size:19px;margin:10px 0}
+.meta{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0}
+.tag{font-size:11px;padding:4px 7px;border-radius:12px;background:#f1f5f9;color:#475569}
+.tag.paid{background:#dcfce7;color:#166534}
+.tag.mandatory{background:#fef3c7;color:#92400e}
+.payment .actions button{font-size:12px;padding:7px 10px}
+.empty{padding:25px;text-align:center;color:#64748b;background:#f8fafc;border-radius:8px}
+#message{display:none;padding:11px 14px;border-radius:7px;margin-bottom:14px;white-space:pre-wrap;overflow-wrap:anywhere}
+#message.error{display:block;background:#fee2e2;color:#991b1b}
+#message.success{display:block;background:#dcfce7;color:#166534}
+#login-screen{position:fixed;inset:0;background:#0008;display:none;justify-content:center;align-items:center;z-index:10;padding:16px}
+.auth-box{width:320px;max-width:100%;background:white;padding:24px;border-radius:10px}
+.auth-box h2{margin:0 0 14px}
+.auth-box input{margin-bottom:10px}
+.auth-box button{width:100%}
+.switch-mode{margin-top:12px;text-align:center;color:#2563eb;cursor:pointer;font-size:13px}
+@media(max-width:650px){
+ body{padding:10px}.topbar h1{font-size:21px}
+ .stats{grid-template-columns:1fr}
+ .form-grid{grid-template-columns:1fr}
+ .form-grid .wide{grid-column:auto}
+ .check-row{padding-top:4px}
+ .panel{padding:12px}
+}
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="auth-box">
+    <h2 id="auth-title">Вход</h2>
+    <input id="auth-username" autocomplete="username" placeholder="Логин">
+    <input id="auth-password" type="password" autocomplete="current-password" placeholder="Пароль">
+    <button id="auth-btn" onclick="handleAuth()">Войти</button>
+    <div id="auth-error" style="color:#dc2626;margin-top:10px;font-size:13px"></div>
+    <div class="switch-mode" onclick="toggleMode()">Регистрация</div>
+  </div>
+</div>
+
+<header class="topbar">
+  <h1>📊 Годовой бюджет</h1>
+  <div class="nav">
+    <a href="/">← К задачам</a>
+    <a href="/savings.html">💵 Накопления</a>
+    <span id="current-user"></span>
+    <button class="secondary" onclick="logout()">Выйти</button>
+  </div>
+</header>
+
+<div id="message" role="status"></div>
+
+<section class="panel">
+  <div class="toolbar">
+    <label class="year-field">Год
+      <input id="year" type="number" min="1900" max="2200" step="1">
+    </label>
+    <button onclick="changeYear()">Показать год</button>
+    <button class="secondary" onclick="resetForm()">+ Новый платёж</button>
+  </div>
+  <div class="stats">
+    <div class="stat"><span>Доходы за год</span><strong id="total-income" class="income">0 ₽</strong></div>
+    <div class="stat"><span>Расходы за год</span><strong id="total-expense" class="expense">0 ₽</strong></div>
+    <div class="stat"><span>Баланс за год</span><strong id="total-balance">0 ₽</strong></div>
+  </div>
+  <h2>План на 12 месяцев</h2>
+  <p class="muted" style="margin:-5px 0 12px">Нажмите на месяц, чтобы отфильтровать платежи. Сводка учитывает все запланированные операции.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Месяц</th><th>Доходы</th><th>Расходы</th><th>Баланс</th><th>Оплачено</th></tr></thead>
+      <tbody id="months-body"></tbody>
+    </table>
+  </div>
+</section>
+
+<section class="panel" id="editor">
+  <h2 id="form-heading">Новый платёж</h2>
+  <form id="item-form">
+    <input type="hidden" id="item-id">
+    <div class="form-grid">
+      <label class="wide">Название
+        <input id="title" maxlength="200" required placeholder="Например, аренда квартиры">
+      </label>
+      <label>Сумма, ₽
+        <input id="amount" type="number" min="0.01" max="1000000000" step="0.01" required placeholder="15000">
+      </label>
+      <label>Тип операции
+        <select id="item-type"><option value="expense">Расход</option><option value="income">Доход</option></select>
+      </label>
+      <label>Категория
+        <input id="category" maxlength="100" value="Без категории" required>
+      </label>
+      <label>Дата платежа
+        <input id="due-date" type="date" required>
+      </label>
+      <label>Статус
+        <select id="status"><option value="planned">Запланирован</option><option value="paid">Оплачен</option></select>
+      </label>
+      <label class="check-row"><input id="mandatory" type="checkbox"> Обязательный расход</label>
+      <label class="check-row"><input id="repeat-monthly" type="checkbox"> Повторять каждый месяц до конца года</label>
+      <label class="wide">Примечание
+        <textarea id="notes" rows="2" maxlength="2000" placeholder="Необязательно"></textarea>
+      </label>
+    </div>
+    <div class="actions">
+      <button type="submit" id="save-btn">Сохранить платёж</button>
+      <button type="button" class="secondary" onclick="resetForm()">Очистить форму</button>
+    </div>
+  </form>
+</section>
+
+<section class="panel">
+  <div class="toolbar">
+    <h2 style="margin:0;flex:1">Платежи</h2>
+    <label style="width:180px">Месяц
+      <select id="month-filter" onchange="renderItems()">
+        <option value="all">Весь год</option>
+        <option value="1">Январь</option><option value="2">Февраль</option>
+        <option value="3">Март</option><option value="4">Апрель</option>
+        <option value="5">Май</option><option value="6">Июнь</option>
+        <option value="7">Июль</option><option value="8">Август</option>
+        <option value="9">Сентябрь</option><option value="10">Октябрь</option>
+        <option value="11">Ноябрь</option><option value="12">Декабрь</option>
+      </select>
+    </label>
+    <label style="width:180px">Тип
+      <select id="type-filter" onchange="renderItems()">
+        <option value="all">Все операции</option>
+        <option value="expense">Расходы</option><option value="income">Доходы</option>
+      </select>
+    </label>
+  </div>
+  <div id="items-list" class="cards"></div>
+</section>
+
+<script>
+let isRegisterMode = false;
+let items = [];
+let summary = [];
+let selectedMonth = 'all';
+let busy = false;
+
+const $ = id => document.getElementById(id);
+const monthNames = ['Январь','Февраль','Март','Апрель','Май','Июнь','Июль','Август','Сентябрь','Октябрь','Ноябрь','Декабрь'];
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'
+  })[ch]);
+}
+function money(kopecks) {
+  return (Number(kopecks || 0) / 100).toLocaleString('ru-RU',{
+    minimumFractionDigits:2,maximumFractionDigits:2
+  }) + ' ₽';
+}
+function rublesToKopecks(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number <= 0) throw new Error('Укажите сумму больше нуля');
+  return Math.round((number + Number.EPSILON) * 100);
+}
+function showMessage(text, type='error') {
+  const el = $('message');
+  el.textContent = text;
+  el.className = type;
+  el.style.display = 'block';
+  if (type === 'success') setTimeout(() => {
+    if (el.textContent === text) el.style.display = 'none';
+  }, 3500);
+}
+function clearMessage() {
+  $('message').style.display = 'none';
+  $('message').textContent = '';
+}
+function getAuthHeaders() {
+  return {
+    'Content-Type':'application/json',
+    'Authorization':'Bearer ' + (localStorage.getItem('auth_token') || '')
+  };
+}
+function showLoginScreen() { $('login-screen').style.display = 'flex'; }
+function hideLoginScreen() { $('login-screen').style.display = 'none'; }
+
+function toggleMode() {
+  isRegisterMode = !isRegisterMode;
+  $('auth-title').textContent = isRegisterMode ? 'Регистрация' : 'Вход';
+  $('auth-btn').textContent = isRegisterMode ? 'Создать аккаунт' : 'Войти';
+  document.querySelector('.switch-mode').textContent = isRegisterMode ? 'Уже есть аккаунт? Войти' : 'Регистрация';
+  $('auth-error').textContent = '';
+}
+async function handleAuth() {
+  const username = $('auth-username').value.trim();
+  const password = $('auth-password').value;
+  $('auth-error').textContent = '';
+  if (!username || !password) {
+    $('auth-error').textContent = 'Заполните логин и пароль';
+    return;
+  }
+  try {
+    const response = await fetch(isRegisterMode ? '/register' : '/token', {
+      method:'POST',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'username='+encodeURIComponent(username)+'&password='+encodeURIComponent(password)
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || 'Ошибка авторизации');
+    if (isRegisterMode) {
+      alert('Аккаунт создан. Теперь войдите.');
+      toggleMode();
+      return;
+    }
+    localStorage.setItem('auth_token',data.access_token);
+    localStorage.setItem('username',username);
+    $('current-user').textContent = 'Вы: '+username;
+    hideLoginScreen();
+    await loadAll();
+  } catch (error) {
+    $('auth-error').textContent = error.message || 'Ошибка авторизации';
+  }
+}
+function logout() {
+  localStorage.removeItem('auth_token');
+  localStorage.removeItem('username');
+  $('current-user').textContent = '';
+  showLoginScreen();
+}
+async function apiJson(url, options={}) {
+  const response = await fetch(url,{
+    ...options,
+    headers:{...getAuthHeaders(),...(options.headers || {})}
+  });
+  if (response.status === 401) {
+    localStorage.removeItem('auth_token');
+    showLoginScreen();
+    throw new Error('Сессия завершена. Войдите снова.');
+  }
+  if (!response.ok) {
+    let detail = '';
+    try {
+      const data = await response.json();
+      detail = data.detail || JSON.stringify(data);
+    } catch (_) {
+      detail = await response.text();
+    }
+    throw new Error(detail || `Ошибка HTTP ${response.status}`);
+  }
+  return response.json();
+}
+async function changeYear() {
+  const year = Number($('year').value);
+  if (!Number.isInteger(year) || year < 1900 || year > 2200) {
+    showMessage('Введите корректный год от 1900 до 2200.');
+    return;
+  }
+  selectedMonth = 'all';
+  $('month-filter').value = 'all';
+  await loadAll();
+}
+async function loadAll() {
+  if (busy) return;
+  busy = true;
+  try {
+    clearMessage();
+    const year = Number($('year').value);
+    const [itemData, summaryData] = await Promise.all([
+      apiJson(`/api/budget/items?year=${year}`),
+      apiJson(`/api/budget/summary?year=${year}`)
+    ]);
+    items = Array.isArray(itemData) ? itemData : (itemData.items || []);
+    summary = summaryData.months || [];
+    renderSummary();
+    renderItems();
+  } catch (error) {
+    showMessage('Не удалось загрузить бюджет: ' + error.message);
+  } finally {
+    busy = false;
+  }
+}
+function renderSummary() {
+  const income = summary.reduce((sum,m) => sum + Number(m.income_kopecks || 0),0);
+  const expense = summary.reduce((sum,m) => sum + Number(m.expense_kopecks || 0),0);
+  $('total-income').textContent = money(income);
+  $('total-expense').textContent = money(expense);
+  $('total-balance').textContent = money(income-expense);
+  $('total-balance').className = income-expense < 0 ? 'balance-negative' : 'balance-positive';
+
+  $('months-body').innerHTML = monthNames.map((name,index) => {
+    const m = summary.find(row => Number(row.month) === index+1) || {};
+    const inc = Number(m.income_kopecks || 0);
+    const exp = Number(m.expense_kopecks || 0);
+    const bal = inc-exp;
+    const paid = Number(m.paid_expense_kopecks || 0);
+    return `<tr data-month="${index+1}" class="${String(index+1)===selectedMonth?'selected':''}" onclick="selectMonth(${index+1})">
+      <td class="month-name">${name}</td><td class="income">${money(inc)}</td>
+      <td class="expense">${money(exp)}</td>
+      <td class="${bal<0?'balance-negative':'balance-positive'}">${money(bal)}</td>
+      <td>${money(paid)}</td></tr>`;
+  }).join('');
+}
+function selectMonth(month) {
+  selectedMonth = String(month);
+  $('month-filter').value = selectedMonth;
+  renderSummary();
+  renderItems();
+}
+function renderItems() {
+  const month = $('month-filter').value;
+  const type = $('type-filter').value;
+  const filtered = items.filter(item => {
+    const itemMonth = String(Number(String(item.due_date).slice(5,7)));
+    return (month==='all' || itemMonth===month) && (type==='all' || item.item_type===type);
+  }).sort((a,b) => a.due_date.localeCompare(b.due_date) || a.id-b.id);
+  if (!filtered.length) {
+    $('items-list').innerHTML = '<div class="empty">В этом разделе пока нет платежей. Добавьте первую операцию выше.</div>';
+    return;
+  }
+  $('items-list').innerHTML = filtered.map(item => {
+    const isIncome = item.item_type === 'income';
+    const date = new Date(item.due_date+'T12:00:00');
+    const dateLabel = Number.isNaN(date.getTime()) ? item.due_date :
+      date.toLocaleDateString('ru-RU',{day:'numeric',month:'long',year:'numeric'});
+    return `<article class="payment">
+      <div class="payment-top"><h3>${escapeHtml(item.title)}</h3>
+        <span class="tag ${item.status==='paid'?'paid':''}">${item.status==='paid'?'Оплачен':'Запланирован'}</span></div>
+      <div class="amount ${isIncome?'income':'expense'}">${isIncome?'+':'−'}${money(item.amount_kopecks)}</div>
+      <div class="meta"><span class="tag">${escapeHtml(item.category || 'Без категории')}</span>
+        <span class="tag">${dateLabel}</span>
+        ${item.mandatory?'<span class="tag mandatory">Обязательный</span>':''}
+        <span class="tag">${isIncome?'Доход':'Расход'}</span></div>
+      ${item.notes?`<p class="muted">${escapeHtml(item.notes)}</p>`:''}
+      <div class="actions">
+        <button type="button" class="secondary" onclick="editItem(${item.id})">Изменить / перенести</button>
+        <button type="button" class="secondary" onclick="togglePaid(${item.id})">${item.status==='paid'?'Вернуть в план':'Отметить оплаченным'}</button>
+        <button type="button" class="danger" onclick="deleteItem(${item.id})">Удалить</button>
+      </div>
+    </article>`;
+  }).join('');
+}
+function resetForm() {
+  $('item-form').reset();
+  $('item-id').value = '';
+  $('category').value = 'Без категории';
+  $('status').value = 'planned';
+  $('repeat-monthly').checked = false;
+  $('repeat-monthly').disabled = false;
+  $('due-date').value = `${$('year').value}-${String(new Date().getMonth()+1).padStart(2,'0')}-${String(new Date().getDate()).padStart(2,'0')}`;
+  $('form-heading').textContent = 'Новый платёж';
+  $('save-btn').textContent = 'Сохранить платёж';
+}
+function editItem(id) {
+  const item = items.find(entry => entry.id === id);
+  if (!item) return;
+  $('item-id').value = item.id;
+  $('title').value = item.title;
+  $('amount').value = (Number(item.amount_kopecks)/100).toFixed(2);
+  $('item-type').value = item.item_type;
+  $('category').value = item.category || 'Без категории';
+  $('due-date').value = item.due_date;
+  $('status').value = item.status;
+  $('mandatory').checked = Boolean(item.mandatory);
+  $('notes').value = item.notes || '';
+  $('repeat-monthly').checked = false;
+  $('repeat-monthly').disabled = true;
+  $('form-heading').textContent = 'Редактирование платежа';
+  $('save-btn').textContent = 'Сохранить изменения';
+  $('editor').scrollIntoView({behavior:'smooth',block:'start'});
+}
+$('item-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const id = $('item-id').value;
+  const title = $('title').value.trim();
+  const category = $('category').value.trim();
+  if (!title || !category) {
+    showMessage('Заполните название и категорию.');
+    return;
+  }
+  let amount;
+  try { amount = rublesToKopecks($('amount').value); }
+  catch (error) { showMessage(error.message); return; }
+
+  const payload = {
+    title, amount_kopecks:amount, item_type:$('item-type').value,
+    category, due_date:$('due-date').value, status:$('status').value,
+    mandatory:$('mandatory').checked, notes:$('notes').value.trim()
+  };
+  if (!payload.due_date) {
+    showMessage('Укажите дату платежа.');
+    return;
+  }
+  payload.repeat_monthly = !id && $('repeat-monthly').checked;
+
+  const button = $('save-btn');
+  button.disabled = true;
+  try {
+    const result = await apiJson(
+      id ? `/api/budget/items/${id}` : '/api/budget/items',
+      {method:id?'PUT':'POST',body:JSON.stringify(payload)}
+    );
+    const newYear = Number(payload.due_date.slice(0,4));
+    $('year').value = newYear;
+    selectedMonth = 'all';
+    $('month-filter').value = 'all';
+    resetForm();
+    await loadAll();
+    const message = id
+      ? 'Изменения сохранены.'
+      : (result.repeat_monthly
+          ? `Создано регулярных операций: ${result.created_count}.`
+          : 'Платёж добавлен.');
+    showMessage(message, 'success');
+  } catch (error) {
+    showMessage('Не удалось сохранить платёж: '+error.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+async function togglePaid(id) {
+  const item = items.find(entry => entry.id === id);
+  if (!item) return;
+  try {
+    await apiJson(`/api/budget/items/${id}`,{
+      method:'PUT',body:JSON.stringify({status:item.status==='paid'?'planned':'paid'})
+    });
+    await loadAll();
+    showMessage('Статус платежа обновлён.','success');
+  } catch (error) {
+    showMessage('Не удалось изменить статус: '+error.message);
+  }
+}
+async function deleteItem(id) {
+  const item = items.find(entry => entry.id === id);
+  if (!item || !confirm(`Удалить платёж «${item.title}»?`)) return;
+  try {
+    await apiJson(`/api/budget/items/${id}`,{method:'DELETE'});
+    await loadAll();
+    showMessage('Платёж удалён.','success');
+  } catch (error) {
+    showMessage('Не удалось удалить платёж: '+error.message);
+  }
+}
+$('year').value = new Date().getFullYear();
+$('due-date').value = new Date().toLocaleDateString('sv-SE');
+$('current-user').textContent = localStorage.getItem('username')
+  ? 'Вы: '+localStorage.getItem('username') : '';
+if (localStorage.getItem('auth_token')) {
+  hideLoginScreen();
+  loadAll();
+} else {
+  showLoginScreen();
+}
+</script>
+</body>
+</html>

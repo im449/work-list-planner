@@ -487,3 +487,435 @@ def test_archiving_goal_preserves_saved_entries():
     assert calendar.status_code == 200, calendar.text
     assert calendar.json()[1]["amount"] == 250
     assert calendar.json()[1]["paid"] is True
+
+# === ТЕСТЫ ГОДОВОГО БЮДЖЕТА ===
+
+def create_budget_item(headers, **overrides):
+    item = {
+        "title": "Оплата интернета",
+        "amount_kopecks": 150000,
+        "item_type": "expense",
+        "category": "Связь",
+        "due_date": "2026-01-15",
+        "mandatory": True,
+        "status": "planned",
+        "notes": "",
+    }
+    item.update(overrides)
+    return client.post("/api/budget/items", json=item, headers=headers)
+
+
+def test_budget_requires_auth():
+    response = client.get("/api/budget/items?year=2026")
+    assert response.status_code == 401
+
+
+def test_budget_create_and_filter_by_year():
+    headers = register_and_login("budget_create_test")
+    created = create_budget_item(headers)
+    assert created.status_code == 200, created.text
+    item = created.json()
+    assert item["title"] == "Оплата интернета"
+    assert item["amount_kopecks"] == 150000
+    assert item["mandatory"] is True
+    assert item["user_id"] > 0
+
+    other_year = create_budget_item(
+        headers,
+        title="Платёж следующего года",
+        due_date="2027-02-01",
+        item_type="expense",
+    )
+    assert other_year.status_code == 200, other_year.text
+
+    response = client.get("/api/budget/items?year=2026", headers=headers)
+    assert response.status_code == 200
+    items = response.json()
+    assert item["id"] in [entry["id"] for entry in items]
+    assert other_year.json()["id"] not in [entry["id"] for entry in items]
+
+
+def test_budget_create_income():
+    headers = register_and_login("budget_income_test")
+    response = create_budget_item(
+        headers,
+        title="Зарплата",
+        amount_kopecks=12500000,
+        item_type="income",
+        category="Зарплата",
+        due_date="2026-03-05",
+        mandatory=False,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["item_type"] == "income"
+    assert response.json()["amount_kopecks"] == 12500000
+
+
+def test_budget_rejects_invalid_amount_and_type():
+    headers = register_and_login("budget_validation_test")
+
+    zero = create_budget_item(headers, amount_kopecks=0)
+    assert zero.status_code == 422
+
+    negative = create_budget_item(headers, amount_kopecks=-100)
+    assert negative.status_code == 422
+
+    bad_type = create_budget_item(headers, item_type="transfer")
+    assert bad_type.status_code == 422
+
+
+def test_budget_update_moves_item_to_another_month():
+    headers = register_and_login("budget_move_test")
+    created = create_budget_item(headers, due_date="2026-01-15")
+    assert created.status_code == 200, created.text
+    item_id = created.json()["id"]
+
+    updated = client.put(
+        f"/api/budget/items/{item_id}",
+        json={"due_date": "2026-04-20", "status": "paid"},
+        headers=headers,
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["due_date"] == "2026-04-20"
+    assert updated.json()["status"] == "paid"
+
+    january = client.get("/api/budget/items?year=2026", headers=headers)
+    assert item_id in [item["id"] for item in january.json()]
+    assert next(item for item in january.json() if item["id"] == item_id)["due_date"] == "2026-04-20"
+
+
+def test_budget_prevents_access_to_another_users_item():
+    owner_headers = register_and_login("budget_owner_test")
+    other_headers = register_and_login("budget_other_test")
+
+    created = create_budget_item(owner_headers)
+    assert created.status_code == 200, created.text
+    item_id = created.json()["id"]
+
+    listing = client.get("/api/budget/items?year=2026", headers=other_headers)
+    assert listing.status_code == 200
+    assert item_id not in [item["id"] for item in listing.json()]
+
+    update = client.put(
+        f"/api/budget/items/{item_id}",
+        json={"title": "Чужая операция"},
+        headers=other_headers,
+    )
+    assert update.status_code == 404
+
+    delete = client.delete(
+        f"/api/budget/items/{item_id}",
+        headers=other_headers,
+    )
+    assert delete.status_code == 404
+
+    owner_listing = client.get("/api/budget/items?year=2026", headers=owner_headers)
+    assert item_id in [item["id"] for item in owner_listing.json()]
+
+
+def test_budget_delete_item():
+    headers = register_and_login("budget_delete_test")
+    created = create_budget_item(headers)
+    assert created.status_code == 200, created.text
+    item_id = created.json()["id"]
+
+    deleted = client.delete(f"/api/budget/items/{item_id}", headers=headers)
+    assert deleted.status_code == 200, deleted.text
+
+    listing = client.get("/api/budget/items?year=2026", headers=headers)
+    assert item_id not in [item["id"] for item in listing.json()]
+
+# === ДОПОЛНИТЕЛЬНЫЕ ГРАНИЧНЫЕ ТЕСТЫ БЮДЖЕТА ===
+
+def test_budget_rejects_invalid_date_and_blank_title():
+    headers = register_and_login("budget_edge_validation")
+
+    invalid_date = create_budget_item(headers, due_date="2026-02-30")
+    assert invalid_date.status_code == 422
+
+    blank_title = create_budget_item(headers, title="")
+    assert blank_title.status_code == 422
+
+
+def test_budget_rejects_invalid_year_range():
+    headers = register_and_login("budget_edge_year")
+
+    too_early = client.get(
+        "/api/budget/items?year=1899",
+        headers=headers,
+    )
+    assert too_early.status_code == 400
+
+    too_late = client.get(
+        "/api/budget/items?year=2201",
+        headers=headers,
+    )
+    assert too_late.status_code == 400
+
+
+def test_budget_partial_update_preserves_other_fields():
+    headers = register_and_login("budget_edge_partial_update")
+    created = create_budget_item(headers)
+    assert created.status_code == 200, created.text
+    original = created.json()
+
+    updated = client.put(
+        f"/api/budget/items/{original['id']}",
+        json={"status": "paid"},
+        headers=headers,
+    )
+    assert updated.status_code == 200, updated.text
+
+    result = updated.json()
+    assert result["status"] == "paid"
+    assert result["title"] == original["title"]
+    assert result["amount_kopecks"] == original["amount_kopecks"]
+    assert result["due_date"] == original["due_date"]
+
+
+def test_budget_rejects_invalid_update_values():
+    headers = register_and_login("budget_edge_update_validation")
+    created = create_budget_item(headers)
+    assert created.status_code == 200, created.text
+    item_id = created.json()["id"]
+
+    invalid_amount = client.put(
+        f"/api/budget/items/{item_id}",
+        json={"amount_kopecks": 0},
+        headers=headers,
+    )
+    assert invalid_amount.status_code == 422
+
+    invalid_status = client.put(
+        f"/api/budget/items/{item_id}",
+        json={"status": "cancelled"},
+        headers=headers,
+    )
+    assert invalid_status.status_code == 422
+
+# === ТЕСТЫ СВОДКИ ГОДОВОГО БЮДЖЕТА ===
+
+def test_budget_summary_returns_twelve_months_and_totals():
+    headers = register_and_login("budget_summary_totals")
+
+    income = create_budget_item(
+        headers,
+        title="Зарплата",
+        amount_kopecks=30000000,
+        item_type="income",
+        due_date="2026-01-05",
+    )
+    expense = create_budget_item(
+        headers,
+        title="Аренда",
+        amount_kopecks=10000000,
+        item_type="expense",
+        due_date="2026-01-10",
+        mandatory=True,
+        status="paid",
+    )
+    unpaid = create_budget_item(
+        headers,
+        title="Покупки",
+        amount_kopecks=2500000,
+        item_type="expense",
+        due_date="2026-01-20",
+        mandatory=False,
+        status="planned",
+    )
+    next_year = create_budget_item(
+        headers,
+        title="Платёж следующего года",
+        amount_kopecks=5000000,
+        item_type="expense",
+        due_date="2027-01-10",
+    )
+
+    for response in (income, expense, unpaid, next_year):
+        assert response.status_code == 200, response.text
+
+    response = client.get(
+        "/api/budget/summary?year=2026",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+
+    result = response.json()
+    assert result["year"] == 2026
+    assert len(result["months"]) == 12
+
+    january = result["months"][0]
+    assert january["month"] == 1
+    assert january["income_kopecks"] == 30000000
+    assert january["expense_kopecks"] == 12500000
+    assert january["balance_kopecks"] == 17500000
+    assert january["paid_expense_kopecks"] == 10000000
+    assert january["mandatory_expense_kopecks"] == 10000000
+
+    february = result["months"][1]
+    assert february["income_kopecks"] == 0
+    assert february["expense_kopecks"] == 0
+    assert february["balance_kopecks"] == 0
+
+
+def test_budget_summary_requires_auth_and_valid_year():
+    unauthorized = client.get("/api/budget/summary?year=2026")
+    assert unauthorized.status_code == 401
+
+    headers = register_and_login("budget_summary_year")
+    invalid = client.get(
+        "/api/budget/summary?year=2201",
+        headers=headers,
+    )
+    assert invalid.status_code == 400
+
+def test_budget_summary_isolated_between_users():
+    owner_headers = register_and_login("budget_summary_owner")
+    other_headers = register_and_login("budget_summary_other")
+
+    created = create_budget_item(
+        owner_headers,
+        title="Личный доход",
+        amount_kopecks=9876543,
+        item_type="income",
+        due_date="2026-06-10",
+    )
+    assert created.status_code == 200, created.text
+
+    owner_summary = client.get(
+        "/api/budget/summary?year=2026",
+        headers=owner_headers,
+    )
+    other_summary = client.get(
+        "/api/budget/summary?year=2026",
+        headers=other_headers,
+    )
+
+    assert owner_summary.status_code == 200, owner_summary.text
+    assert other_summary.status_code == 200, other_summary.text
+
+    owner_june = owner_summary.json()["months"][5]
+    other_june = other_summary.json()["months"][5]
+
+    assert owner_june["income_kopecks"] == 9876543
+    assert other_june["income_kopecks"] == 0
+
+
+def test_budget_rejects_whitespace_only_title_and_category():
+    headers = register_and_login("budget_whitespace_validation")
+
+    blank_title = create_budget_item(headers, title="   ")
+    assert blank_title.status_code == 422
+
+    blank_category = create_budget_item(headers, category="   ")
+    assert blank_category.status_code == 422
+
+
+def test_budget_update_rejects_null_and_whitespace_fields():
+    headers = register_and_login("budget_null_validation")
+    created = create_budget_item(headers)
+    assert created.status_code == 200, created.text
+    item_id = created.json()["id"]
+
+    for payload in (
+        {"title": None},
+        {"amount_kopecks": None},
+        {"due_date": None},
+        {"title": "   "},
+        {"category": "   "},
+    ):
+        response = client.put(
+            f"/api/budget/items/{item_id}",
+            json=payload,
+            headers=headers,
+        )
+        assert response.status_code == 422, (
+            f"Payload {payload!r}: {response.status_code} {response.text}"
+        )
+
+
+
+def test_budget_monthly_recurrence_creates_twelve_items():
+    headers = register_and_login("budget_monthly_expense")
+    response = create_budget_item(
+        headers,
+        title="Аренда",
+        amount_kopecks=3500000,
+        due_date="2028-01-31",
+        repeat_monthly=True,
+        status="paid",
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["repeat_monthly"] is True
+    assert data["created_count"] == 12
+
+    items_response = client.get(
+        "/api/budget/items?year=2028", headers=headers
+    )
+    assert items_response.status_code == 200
+    items = [x for x in items_response.json() if x["title"] == "Аренда"]
+    assert len(items) == 12
+    assert [x["due_date"] for x in items][1] == "2028-02-29"
+    assert [x["due_date"] for x in items][-1] == "2028-12-31"
+    assert all(x["status"] == "planned" for x in items)
+    assert all(x["amount_kopecks"] == 3500000 for x in items)
+
+
+def test_budget_monthly_income_and_independent_updates():
+    headers = register_and_login("budget_monthly_income")
+    response = create_budget_item(
+        headers,
+        title="Зарплата",
+        amount_kopecks=12000000,
+        item_type="income",
+        due_date="2026-01-10",
+        repeat_monthly=True,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["created_count"] == 12
+
+    items = client.get(
+        "/api/budget/items?year=2026", headers=headers
+    ).json()
+    salaries = [x for x in items if x["title"] == "Зарплата"]
+    assert len(salaries) == 12
+    assert all(x["item_type"] == "income" for x in salaries)
+
+    march = next(x for x in salaries if x["due_date"] == "2026-03-10")
+    updated = client.put(
+        f"/api/budget/items/{march['id']}",
+        json={"amount_kopecks": 13000000},
+        headers=headers,
+    )
+    assert updated.status_code == 200, updated.text
+
+    refreshed = client.get(
+        "/api/budget/items?year=2026", headers=headers
+    ).json()
+    salaries = [x for x in refreshed if x["title"] == "Зарплата"]
+    assert len(salaries) == 12
+    assert next(x for x in salaries if x["due_date"] == "2026-03-10")[
+        "amount_kopecks"
+    ] == 13000000
+    assert next(x for x in salaries if x["due_date"] == "2026-04-10")[
+        "amount_kopecks"
+    ] == 12000000
+
+
+def test_budget_monthly_recurrence_isolated_between_users():
+    owner = register_and_login("budget_monthly_owner")
+    other = register_and_login("budget_monthly_other")
+    response = create_budget_item(
+        owner,
+        title="Интернет",
+        due_date="2026-01-15",
+        repeat_monthly=True,
+    )
+    assert response.status_code == 200, response.text
+
+    other_items = client.get(
+        "/api/budget/items?year=2026", headers=other
+    )
+    assert other_items.status_code == 200
+    assert all(x["title"] != "Интернет" for x in other_items.json())
