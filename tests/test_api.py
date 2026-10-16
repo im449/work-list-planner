@@ -1,5 +1,5 @@
 from fastapi.testclient import TestClient
-from main import app, limiter
+from main import app, limiter, db
 
 # Отключаем rate limit только в отдельном процессе тестов.
 # В работающем production-процессе эта настройка не меняется.
@@ -25,6 +25,79 @@ def test_register_and_login():
 def test_login_with_wrong_password():
     resp = client.post("/token", data={"username": "alice_test", "password": "wrong"})
     assert resp.status_code == 401
+
+
+def test_old_token_is_rejected_after_token_version_changes():
+    headers = register_and_login("token_version_test")
+    assert client.get("/users/me", headers=headers).status_code == 200
+    conn = db()
+    try:
+        conn.execute(
+            "UPDATE users SET token_version = token_version + 1 WHERE username = ?",
+            ("token_version_test",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert client.get("/users/me", headers=headers).status_code == 401
+
+
+def test_change_password_invalidates_old_token():
+    headers = register_and_login("password_change_test")
+
+    resp = client.post(
+        "/users/me/password",
+        json={
+            "current_password": "pass12345",
+            "new_password": "new-secure-pass-123",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    assert client.get("/users/me", headers=headers).status_code == 401
+
+    old_login = client.post(
+        "/token",
+        data={"username": "password_change_test", "password": "pass12345"},
+    )
+    assert old_login.status_code == 401
+
+    new_login = client.post(
+        "/token",
+        data={
+            "username": "password_change_test",
+            "password": "new-secure-pass-123",
+        },
+    )
+    assert new_login.status_code == 200
+
+
+def test_change_password_rejects_wrong_current_password():
+    headers = register_and_login("password_wrong_current_test")
+    resp = client.post(
+        "/users/me/password",
+        json={
+            "current_password": "wrong-password",
+            "new_password": "new-secure-pass-123",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert client.get("/users/me", headers=headers).status_code == 200
+
+
+def test_change_password_rejects_short_new_password():
+    headers = register_and_login("password_short_test")
+    resp = client.post(
+        "/users/me/password",
+        json={
+            "current_password": "pass12345",
+            "new_password": "short",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert client.get("/users/me", headers=headers).status_code == 200
 
 
 def test_tasks_require_auth():

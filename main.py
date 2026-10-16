@@ -81,6 +81,9 @@ def init_db():
     if "last_seen" not in user_cols:
         c.execute("ALTER TABLE users ADD COLUMN last_seen TEXT")
 
+    if "token_version" not in user_cols:
+        c.execute("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS app_settings (
             key TEXT PRIMARY KEY,
@@ -236,12 +239,15 @@ def get_password_hash(password):
 def authenticate_user(username: str, password: str):
     conn = db()
     row = conn.execute(
-        "SELECT id, username, password_hash, role, is_active FROM users WHERE username = ?", (username,)
+        "SELECT id, username, password_hash, role, is_active, token_version FROM users WHERE username = ?", (username,)
     ).fetchone()
     conn.close()
     if not row or not row["is_active"] or not verify_password(password, row["password_hash"]):
         return False
-    return {"id": row["id"], "username": row["username"], "role": row["role"]}
+    return {
+        "id": row["id"], "username": row["username"],
+        "role": row["role"], "token_version": row["token_version"],
+    }
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -266,11 +272,14 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     conn = db()
     try:
         row = conn.execute(
-            "SELECT id, username, role, is_active FROM users WHERE username = ?",
+            "SELECT id, username, role, is_active, token_version FROM users WHERE username = ?",
             (username,)
         ).fetchone()
 
         if not row or not row["is_active"]:
+            raise credentials_exception
+
+        if payload.get("ver", 0) != row["token_version"]:
             raise credentials_exception
 
         # Не чаще одного обновления за пять минут для каждого пользователя.
@@ -298,6 +307,58 @@ async def require_admin(user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="Требуются права администратора")
     return user
 
+class PasswordChange(BaseModel):
+    current_password: str = Field(min_length=1)
+    new_password: str = Field(min_length=1)
+
+
+@app.post("/users/me/password")
+async def change_password(
+    data: PasswordChange,
+    current_user: dict = Depends(get_current_user),
+):
+    if len(data.new_password) < 12:
+        raise HTTPException(
+            status_code=400,
+            detail="Новый пароль должен содержать не менее 12 символов",
+        )
+
+    if data.current_password == data.new_password:
+        raise HTTPException(
+            status_code=400,
+            detail="Новый пароль должен отличаться от текущего",
+        )
+
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT password_hash FROM users WHERE id = ?",
+            (current_user["id"],),
+        ).fetchone()
+
+        if not row or not verify_password(
+            data.current_password, row["password_hash"]
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Текущий пароль указан неверно",
+            )
+
+        conn.execute(
+            """UPDATE users
+               SET password_hash = ?, token_version = token_version + 1
+               WHERE id = ?""",
+            (get_password_hash(data.new_password), current_user["id"]),
+        )
+        conn.commit()
+        return {"status": "ok", "message": "Пароль успешно изменён"}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 @app.get("/users/me")
 async def read_current_user(current_user: dict = Depends(get_current_user)):
     return current_user
@@ -316,7 +377,8 @@ async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends
         )
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
-        data={"sub": user["username"]}, expires_delta=access_token_expires
+        data={"sub": user["username"], "ver": user["token_version"]},
+        expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
