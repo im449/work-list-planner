@@ -117,7 +117,16 @@
     <a href="/savings.html" style="color:#2563EB; text-decoration:none; margin-right:16px; font-weight:600;">💵 Накопления</a>
     <a href="/budget.html" style="color:#2563EB; text-decoration:none; margin-right:16px; font-weight:600;">📊 Годовой бюджет</a>
     <span id="current-user"></span>
+    <button class="btn-logout" onclick="togglePasswordForm()">Сменить пароль</button>
     <button class="btn-logout" onclick="logout()">Выйти</button>
+  </div>
+  <div id="password-panel" class="form-block" style="display:none; max-width:360px; margin:10px 0 16px auto;">
+    <h3 style="margin-bottom:10px;">Смена пароля</h3>
+    <input id="password-current" type="password" autocomplete="current-password" placeholder="Текущий пароль">
+    <input id="password-new" type="password" autocomplete="new-password" placeholder="Новый пароль (от 12 символов)">
+    <input id="password-confirm" type="password" autocomplete="new-password" placeholder="Повторите новый пароль">
+    <button type="button" onclick="changePassword()">Изменить пароль</button>
+    <div id="password-message" style="margin-top:8px; font-size:13px;"></div>
   </div>
 </div>
 
@@ -249,6 +258,72 @@ function getAuthHeaders() {
     'Content-Type': 'application/json',
     'Authorization': 'Bearer ' + (token || '')
   };
+}
+
+function togglePasswordForm() {
+  const panel = document.getElementById('password-panel');
+  const opening = panel.style.display === 'none';
+  panel.style.display = opening ? 'block' : 'none';
+  document.getElementById('password-message').innerText = '';
+}
+
+async function changePassword() {
+  const current = document.getElementById('password-current').value;
+  const next = document.getElementById('password-new').value;
+  const confirm = document.getElementById('password-confirm').value;
+  const message = document.getElementById('password-message');
+
+  message.style.color = '#dc3545';
+
+  if (!current || !next || !confirm) {
+    message.innerText = 'Заполните все три поля.';
+    return;
+  }
+  if (next.length < 12) {
+    message.innerText = 'Новый пароль должен содержать не менее 12 символов.';
+    return;
+  }
+  if (next !== confirm) {
+    message.innerText = 'Новый пароль и подтверждение не совпадают.';
+    return;
+  }
+
+  const button = document.querySelector('#password-panel button');
+  button.disabled = true;
+  button.innerText = 'Изменение...';
+
+  try {
+    const res = await fetch('/users/me/password', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        current_password: current,
+        new_password: next
+      })
+    });
+
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      const detail = data.detail;
+      throw new Error(
+        typeof detail === 'string' ? detail : 'Не удалось изменить пароль. Проверьте текущий пароль и попробуйте ещё раз.'
+      );
+    }
+
+    document.getElementById('password-current').value = '';
+    document.getElementById('password-new').value = '';
+    document.getElementById('password-confirm').value = '';
+    message.style.color = '#198754';
+    message.innerText = 'Пароль изменён. Выполняется выход...';
+
+    setTimeout(() => logout(), 800);
+  } catch (err) {
+    message.innerText = err.message || 'Ошибка при смене пароля.';
+  } finally {
+    button.disabled = false;
+    button.innerText = 'Изменить пароль';
+  }
 }
 
 function toggleArchive() {
