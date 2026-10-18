@@ -100,6 +100,28 @@ def test_change_password_rejects_short_new_password():
     assert client.get("/users/me", headers=headers).status_code == 200
 
 
+def test_change_password_rejects_same_password():
+    headers = register_and_login("password_same_test")
+
+    resp = client.post(
+        "/users/me/password",
+        json={
+            "current_password": "pass12345",
+            "new_password": "pass12345",
+        },
+        headers=headers,
+    )
+
+    assert resp.status_code == 400
+    assert client.get("/users/me", headers=headers).status_code == 200
+
+    login = client.post(
+        "/token",
+        data={"username": "password_same_test", "password": "pass12345"},
+    )
+    assert login.status_code == 200
+
+
 def test_tasks_require_auth():
     resp = client.get("/tasks")
     assert resp.status_code == 401
@@ -992,3 +1014,149 @@ def test_budget_monthly_recurrence_isolated_between_users():
     )
     assert other_items.status_code == 200
     assert all(x["title"] != "Интернет" for x in other_items.json())
+
+
+# === ТЕСТЫ API КАТЕГОРИЙ ГОДОВОГО БЮДЖЕТА ===
+
+def test_budget_categories_return_defaults_by_type():
+    headers = register_and_login("budget_categories_defaults")
+    response = client.get("/api/budget/categories", headers=headers)
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert "Зарплата и премии" in data["income"]
+    assert "Жильё и коммунальные услуги" in data["expense"]
+    assert len(data["income"]) > 0
+    assert len(data["expense"]) > 0
+
+
+def test_budget_category_can_be_created():
+    headers = register_and_login("budget_category_create")
+    response = client.post(
+        "/api/budget/categories",
+        headers=headers,
+        json={"item_type": "expense", "name": "Ветеринар"},
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json() == {
+        "item_type": "expense",
+        "name": "Ветеринар",
+    }
+
+    categories = client.get("/api/budget/categories", headers=headers)
+    assert categories.status_code == 200, categories.text
+    assert "Ветеринар" in categories.json()["expense"]
+
+
+def test_budget_category_duplicate_is_rejected():
+    headers = register_and_login("budget_category_duplicate")
+    payload = {"item_type": "income", "name": "Аренда"}
+
+    first = client.post(
+        "/api/budget/categories", headers=headers, json=payload
+    )
+    second = client.post(
+        "/api/budget/categories", headers=headers, json=payload
+    )
+
+    assert first.status_code == 201, first.text
+    assert second.status_code == 409, second.text
+
+
+def test_budget_categories_are_isolated_between_users():
+    owner = register_and_login("budget_category_owner")
+    other = register_and_login("budget_category_other")
+
+    created = client.post(
+        "/api/budget/categories",
+        headers=owner,
+        json={"item_type": "expense", "name": "Только для владельца"},
+    )
+    assert created.status_code == 201, created.text
+
+    owner_categories = client.get(
+        "/api/budget/categories", headers=owner
+    )
+    other_categories = client.get(
+        "/api/budget/categories", headers=other
+    )
+
+    assert owner_categories.status_code == 200
+    assert other_categories.status_code == 200
+    assert "Только для владельца" in owner_categories.json()["expense"]
+    assert "Только для владельца" not in other_categories.json()["expense"]
+def test_budget_category_rename_updates_existing_items():
+    headers = register_and_login("budget_category_rename")
+    old_name = "Старая тестовая категория"
+    new_name = "Новая тестовая категория"
+
+    created = client.post(
+        "/api/budget/categories",
+        headers=headers,
+        json={"item_type": "expense", "name": old_name},
+    )
+    assert created.status_code == 201, created.text
+
+    item = create_budget_item(headers, category=old_name)
+    assert item.status_code == 200, item.text
+
+    renamed = client.patch(
+        "/api/budget/categories",
+        headers=headers,
+        json={
+            "item_type": "expense",
+            "old_name": old_name,
+            "new_name": new_name,
+        },
+    )
+    assert renamed.status_code == 200, renamed.text
+
+    items = client.get(
+        "/api/budget/items?year=2026", headers=headers
+    ).json()
+    assert any(x["category"] == new_name for x in items)
+    assert all(x["category"] != old_name for x in items)
+
+    categories = client.get(
+        "/api/budget/categories", headers=headers
+    ).json()
+    assert new_name in categories["expense"]
+    assert old_name not in categories["expense"]
+
+
+def test_budget_category_delete_checks_usage():
+    headers = register_and_login("budget_category_delete")
+    used_name = "Используемая тестовая категория"
+    empty_name = "Пустая тестовая категория"
+
+    for name in (used_name, empty_name):
+        created = client.post(
+            "/api/budget/categories",
+            headers=headers,
+            json={"item_type": "expense", "name": name},
+        )
+        assert created.status_code == 201, created.text
+
+    item = create_budget_item(headers, category=used_name)
+    assert item.status_code == 200, item.text
+
+    blocked = client.delete(
+        "/api/budget/categories",
+        headers=headers,
+        params={"item_type": "expense", "name": used_name},
+    )
+    assert blocked.status_code == 409, blocked.text
+
+    deleted = client.delete(
+        "/api/budget/categories",
+        headers=headers,
+        params={"item_type": "expense", "name": empty_name},
+    )
+    assert deleted.status_code == 200, deleted.text
+
+    categories = client.get(
+        "/api/budget/categories", headers=headers
+    ).json()
+    assert used_name in categories["expense"]
+    assert empty_name not in categories["expense"]

@@ -34,6 +34,11 @@ tbody tr{cursor:pointer}
 tbody tr:hover{background:#f8fafc}
 tbody tr.selected{background:#eff6ff}
 .month-name{font-weight:600}
+.progress-amount{font-weight:600;margin-bottom:7px}
+.progress-meta{display:flex;align-items:center;gap:8px}
+.progress-label{font-size:11px;color:#64748b;min-width:58px;text-align:left}
+.progress-track{height:7px;min-width:65px;flex:1;background:#e2e8f0;border-radius:999px;overflow:hidden}
+.progress-fill{height:100%;background:#16a34a;border-radius:999px;transition:width .2s ease}
 .muted{color:#64748b;font-size:13px}
 .form-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
 .form-grid .wide{grid-column:span 2}
@@ -114,7 +119,7 @@ tbody tr.selected{background:#eff6ff}
   <p class="muted" style="margin:-5px 0 12px">Нажмите на месяц, чтобы отфильтровать платежи. Сводка учитывает все запланированные операции.</p>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Месяц</th><th>Доходы</th><th>Расходы</th><th>Баланс</th><th>Оплачено</th></tr></thead>
+      <thead><tr><th>Месяц</th><th>Доходы</th><th>Расходы</th><th>Баланс</th><th>Оплачено / выполнение</th></tr></thead>
       <tbody id="months-body"></tbody>
     </table>
   </div>
@@ -135,8 +140,15 @@ tbody tr.selected{background:#eff6ff}
         <select id="item-type"><option value="expense">Расход</option><option value="income">Доход</option></select>
       </label>
       <label>Категория
-        <input id="category" maxlength="100" value="Без категории" required>
+        <select id="category" required>
+          <option value="">Загрузка категорий...</option>
+        </select>
       </label>
+      <div class="actions">
+ <button type="button" class="secondary" onclick="addBudgetCategory()">Добавить категорию</button>
+  <button type="button" class="secondary" onclick="renameBudgetCategory()">Переименовать</button>
+  <button type="button" class="danger" onclick="deleteBudgetCategory()">Удалить категорию</button>
+      </div>
       <label>Дата платежа
         <input id="due-date" type="date" required>
       </label>
@@ -176,6 +188,13 @@ tbody tr.selected{background:#eff6ff}
         <option value="expense">Расходы</option><option value="income">Доходы</option>
       </select>
     </label>
+    <label style="width:180px">Обязательность
+      <select id="mandatory-filter" onchange="renderItems()">
+        <option value="all">Все операции</option>
+        <option value="yes">Только обязательные расходы</option>
+        <option value="no">Только необязательные расходы</option>
+      </select>
+    </label>
   </div>
   <div id="items-list" class="cards"></div>
 </section>
@@ -184,6 +203,7 @@ tbody tr.selected{background:#eff6ff}
 let isRegisterMode = false;
 let items = [];
 let summary = [];
+let budgetCategories = {income: [], expense: []};
 let selectedMonth = 'all';
 let busy = false;
 
@@ -195,6 +215,101 @@ function escapeHtml(value) {
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'
   })[ch]);
 }
+function renderCategoryOptions(selected = "") {
+  const type = $("item-type").value;
+  const select = $("category");
+  const names = budgetCategories[type] || [];
+  const values = [...names];
+  if (selected && !values.some(name => name.toLowerCase() === selected.toLowerCase())) {
+    values.unshift(selected);
+  }
+  select.innerHTML = values.map(name =>
+    `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`
+  ).join("");
+  if (selected && values.includes(selected)) select.value = selected;
+  else if (values.length) select.value = values[0];
+}
+async function loadBudgetCategories(selected = "") {
+  budgetCategories = await apiJson("/api/budget/categories");
+  renderCategoryOptions(selected);
+}
+async function addBudgetCategory() {
+  const name = prompt("Название новой категории:");
+  if (name === null) return;
+  if (!name.trim()) {
+    showMessage("Введите название категории.");
+    return;
+  }
+  const type = $("item-type").value;
+  try {
+    await apiJson("/api/budget/categories", {
+      method: "POST",
+      body: JSON.stringify({item_type: type, name: name.trim()})
+    });
+    await loadBudgetCategories(name.trim());
+    showMessage("Категория добавлена.", "success");
+  } catch (error) {
+    showMessage("Не удалось добавить категорию: " + error.message);
+  }
+}
+async function renameBudgetCategory() {
+  const oldName = $("category").value;
+  if (!oldName) {
+    showMessage("Сначала выберите категорию.");
+    return;
+  }
+
+  const newName = prompt("Новое название категории:", oldName);
+  if (newName === null) return;
+  if (!newName.trim()) {
+    showMessage("Название категории не может быть пустым.");
+    return;
+  }
+
+  try {
+    await apiJson("/api/budget/categories", {
+      method: "PATCH",
+      body: JSON.stringify({
+        item_type: $("item-type").value,
+        old_name: oldName,
+        new_name: newName.trim()
+      })
+    });
+    await loadBudgetCategories(newName.trim());
+    await loadAll();
+    showMessage("Категория переименована.", "success");
+  } catch (error) {
+    showMessage("Не удалось переименовать категорию: " + error.message);
+  }
+}
+
+async function deleteBudgetCategory() {
+  const name = $("category").value;
+  if (!name) {
+    showMessage("Сначала выберите категорию.");
+    return;
+  }
+
+  if (!confirm(`Удалить категорию «${name}»?`)) return;
+
+  try {
+    await apiJson(
+      "/api/budget/categories?item_type=" +
+      encodeURIComponent($("item-type").value) +
+      "&name=" + encodeURIComponent(name),
+      {method: "DELETE"}
+    );
+    await loadBudgetCategories();
+    showMessage("Категория удалена.", "success");
+  } catch (error) {
+    showMessage("Не удалось удалить категорию: " + error.message);
+  }
+}
+$("item-type").addEventListener("change", () => {
+  renderCategoryOptions();
+  updateStatusLabels();
+});
+
 function money(kopecks) {
   return (Number(kopecks || 0) / 100).toLocaleString('ru-RU',{
     minimumFractionDigits:2,maximumFractionDigits:2
@@ -314,6 +429,11 @@ async function loadAll() {
     ]);
     items = Array.isArray(itemData) ? itemData : (itemData.items || []);
     summary = summaryData.months || [];
+    try {
+      await loadBudgetCategories();
+    } catch (categoryError) {
+      console.error("Не удалось загрузить категории:", categoryError);
+    }
     renderSummary();
     renderItems();
   } catch (error) {
@@ -336,11 +456,20 @@ function renderSummary() {
     const exp = Number(m.expense_kopecks || 0);
     const bal = inc-exp;
     const paid = Number(m.paid_expense_kopecks || 0);
+    const progress = exp > 0 ? Math.min(100, Math.max(0, Math.round(paid / exp * 100))) : 0;
     return `<tr data-month="${index+1}" class="${String(index+1)===selectedMonth?'selected':''}" onclick="selectMonth(${index+1})">
       <td class="month-name">${name}</td><td class="income">${money(inc)}</td>
       <td class="expense">${money(exp)}</td>
       <td class="${bal<0?'balance-negative':'balance-positive'}">${money(bal)}</td>
-      <td>${money(paid)}</td></tr>`;
+      <td>
+        <div class="progress-amount">${money(paid)}</div>
+        <div class="progress-meta">
+          <span class="progress-label">${progress}% плана</span>
+          <div class="progress-track" role="progressbar" aria-valuenow="${progress}" aria-valuemin="0" aria-valuemax="100" aria-label="Оплачено расходов за ${name}">
+            <div class="progress-fill" style="width:${progress}%"></div>
+          </div>
+        </div>
+      </td></tr>`;
   }).join('');
 }
 function selectMonth(month) {
@@ -350,11 +479,19 @@ function selectMonth(month) {
   renderItems();
 }
 function renderItems() {
-  const month = $('month-filter').value;
-  const type = $('type-filter').value;
+  const month = $("month-filter").value;
+  const type = $("type-filter").value;
+  const mandatory = $("mandatory-filter").value;
   const filtered = items.filter(item => {
     const itemMonth = String(Number(String(item.due_date).slice(5,7)));
-    return (month==='all' || itemMonth===month) && (type==='all' || item.item_type===type);
+    const matchesMonth = month === "all" || itemMonth === month;
+    const matchesType = type === "all" || item.item_type === type;
+    const matchesMandatory =
+      mandatory === "all" ||
+      (item.item_type === "expense" && (
+        mandatory === "yes" ? Boolean(item.mandatory) : !item.mandatory
+      ));
+    return matchesMonth && matchesType && matchesMandatory;
   }).sort((a,b) => a.due_date.localeCompare(b.due_date) || a.id-b.id);
   if (!filtered.length) {
     $('items-list').innerHTML = '<div class="empty">В этом разделе пока нет платежей. Добавьте первую операцию выше.</div>';
@@ -367,7 +504,7 @@ function renderItems() {
       date.toLocaleDateString('ru-RU',{day:'numeric',month:'long',year:'numeric'});
     return `<article class="payment">
       <div class="payment-top"><h3>${escapeHtml(item.title)}</h3>
-        <span class="tag ${item.status==='paid'?'paid':''}">${item.status==='paid'?'Оплачен':'Запланирован'}</span></div>
+        <span class="tag ${item.status==='paid'?'paid':''}">${item.item_type==='income'?(item.status==='paid'?'Получен':'Ожидается'):(item.status==='paid'?'Оплачен':'Запланирован')}</span></div>
       <div class="amount ${isIncome?'income':'expense'}">${isIncome?'+':'−'}${money(item.amount_kopecks)}</div>
       <div class="meta"><span class="tag">${escapeHtml(item.category || 'Без категории')}</span>
         <span class="tag">${dateLabel}</span>
@@ -376,17 +513,26 @@ function renderItems() {
       ${item.notes?`<p class="muted">${escapeHtml(item.notes)}</p>`:''}
       <div class="actions">
         <button type="button" class="secondary" onclick="editItem(${item.id})">Изменить / перенести</button>
-        <button type="button" class="secondary" onclick="togglePaid(${item.id})">${item.status==='paid'?'Вернуть в план':'Отметить оплаченным'}</button>
+        <button type="button" class="secondary" onclick="togglePaid(${item.id})">${item.item_type==='income'?(item.status==='paid'?'Вернуть в ожидание':'Отметить полученным'):(item.status==='paid'?'Вернуть в план':'Отметить оплаченным')}</button>
         <button type="button" class="danger" onclick="deleteItem(${item.id})">Удалить</button>
       </div>
     </article>`;
   }).join('');
 }
+function updateStatusLabels() {
+  const isIncome = $("item-type").value === "income";
+  const options = $("status").options;
+  options[0].textContent = isIncome ? "Ожидается" : "Запланирован";
+  options[1].textContent = isIncome ? "Получен" : "Оплачен";
+  $("mandatory").disabled = isIncome;
+  if (isIncome) $("mandatory").checked = false;
+}
 function resetForm() {
   $('item-form').reset();
   $('item-id').value = '';
-  $('category').value = 'Без категории';
+  renderCategoryOptions('Без категории');
   $('status').value = 'planned';
+  updateStatusLabels();
   $('repeat-monthly').checked = false;
   $('repeat-monthly').disabled = false;
   $('due-date').value = `${$('year').value}-${String(new Date().getMonth()+1).padStart(2,'0')}-${String(new Date().getDate()).padStart(2,'0')}`;
@@ -400,10 +546,11 @@ function editItem(id) {
   $('title').value = item.title;
   $('amount').value = (Number(item.amount_kopecks)/100).toFixed(2);
   $('item-type').value = item.item_type;
-  $('category').value = item.category || 'Без категории';
+  updateStatusLabels();
+  renderCategoryOptions(item.category || 'Без категории');
   $('due-date').value = item.due_date;
   $('status').value = item.status;
-  $('mandatory').checked = Boolean(item.mandatory);
+  $('mandatory').checked = item.item_type === 'expense' && Boolean(item.mandatory);
   $('notes').value = item.notes || '';
   $('repeat-monthly').checked = false;
   $('repeat-monthly').disabled = true;

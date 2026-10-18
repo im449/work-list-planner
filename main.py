@@ -220,10 +220,20 @@ def init_db():
         )
     """)
     c.execute("""
+        CREATE TABLE IF NOT EXISTS budget_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            item_type TEXT NOT NULL
+                CHECK (item_type IN ('income', 'expense')),
+            name TEXT COLLATE NOCASE NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(user_id, item_type, name)
+        )
+    """)
+    c.execute("""
         CREATE INDEX IF NOT EXISTS idx_budget_items_user_date
         ON budget_items(user_id, due_date, id)
     """)
-
     conn.commit()
     conn.close()
 
@@ -1486,6 +1496,250 @@ async def delete_budget_item(
 
 
 
+
+class BudgetCategoryCreate(BaseModel):
+    item_type: Literal["income", "expense"]
+    name: str = Field(..., min_length=1, max_length=100)
+
+
+BUDGET_DEFAULT_CATEGORIES = {
+    "expense": [
+        "Жильё и коммунальные услуги",
+        "Продукты и товары для дома",
+        "Транспорт",
+        "Здоровье",
+        "Связь и интернет",
+        "Кредиты и долги",
+        "Образование",
+        "Кафе и развлечения",
+        "Одежда и личные покупки",
+        "Семья и питомцы",
+        "Налоги и страховки",
+        "Ремонт и обслуживание дома",
+        "Путешествия и отпуск",
+        "Подарки и благотворительность",
+        "Другое",
+    ],
+    "income": [
+        "Зарплата и премии",
+        "Подработка и фриланс",
+        "Бизнес",
+        "Доход от инвестиций",
+        "Аренда недвижимости",
+        "Возвраты и компенсации",
+        "Подарки и прочие поступления",
+        "Другой доход",
+    ],
+}
+
+
+@app.get("/api/budget/categories")
+async def list_budget_categories(
+    current_user: dict = Depends(get_current_user),
+):
+    conn = db()
+    try:
+        user_id = current_user["id"]
+        for item_type, names in BUDGET_DEFAULT_CATEGORIES.items():
+            for name in names:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO budget_categories
+                        (user_id, item_type, name)
+                    VALUES (?, ?, ?)
+                    """,
+                    (user_id, item_type, name),
+                )
+        conn.commit()
+
+        result = {"income": [], "expense": []}
+        rows = conn.execute(
+            """
+            SELECT item_type, name
+            FROM budget_categories
+            WHERE user_id = ?
+            ORDER BY id
+            """,
+            (user_id,),
+        ).fetchall()
+        for row in rows:
+            result[row["item_type"]].append(row["name"])
+        return result
+    finally:
+        conn.close()
+
+
+@app.post("/api/budget/categories", status_code=201)
+async def create_budget_category(
+    category: BudgetCategoryCreate,
+    current_user: dict = Depends(get_current_user),
+):
+    name = category.name.strip()
+    if not name:
+        raise HTTPException(
+            status_code=422,
+            detail="Название категории не может быть пустым",
+        )
+
+    conn = db()
+    try:
+        try:
+            conn.execute(
+                """
+                INSERT INTO budget_categories (user_id, item_type, name)
+                VALUES (?, ?, ?)
+                """,
+                (current_user["id"], category.item_type, name),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            raise HTTPException(
+                status_code=409,
+                detail="Такая категория уже существует",
+            )
+        return {"item_type": category.item_type, "name": name}
+    finally:
+        conn.close()
+
+class BudgetCategoryRename(BaseModel):
+    item_type: Literal["income", "expense"]
+    old_name: str = Field(..., min_length=1, max_length=100)
+    new_name: str = Field(..., min_length=1, max_length=100)
+
+
+@app.patch("/api/budget/categories")
+async def rename_budget_category(
+    category: BudgetCategoryRename,
+    current_user: dict = Depends(get_current_user),
+):
+    old_name = category.old_name.strip()
+    new_name = category.new_name.strip()
+
+    if not old_name or not new_name:
+        raise HTTPException(
+            status_code=422,
+            detail="Название категории не может быть пустым",
+        )
+
+    if old_name.casefold() == new_name.casefold():
+        raise HTTPException(
+            status_code=400,
+            detail="Новое название совпадает со старым",
+        )
+
+    conn = db()
+    try:
+        user_id = current_user["id"]
+        existing = conn.execute(
+            """
+            SELECT id FROM budget_categories
+            WHERE user_id = ? AND item_type = ? AND name = ?
+            """,
+            (user_id, category.item_type, old_name),
+        ).fetchone()
+
+        if not existing:
+            raise HTTPException(
+                status_code=404,
+                detail="Категория не найдена",
+            )
+
+        duplicate = conn.execute(
+            """
+            SELECT id FROM budget_categories
+            WHERE user_id = ? AND item_type = ? AND name = ?
+            """,
+            (user_id, category.item_type, new_name),
+        ).fetchone()
+
+        if duplicate:
+            raise HTTPException(
+                status_code=409,
+                detail="Категория с таким названием уже существует",
+            )
+
+        conn.execute(
+            """
+            UPDATE budget_categories
+            SET name = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (new_name, existing["id"], user_id),
+        )
+        conn.execute(
+            """
+            UPDATE budget_items
+            SET category = ?, updated_at = datetime('now')
+            WHERE user_id = ? AND item_type = ? AND category = ?
+            """,
+            (new_name, user_id, category.item_type, old_name),
+        )
+        conn.commit()
+
+        return {
+            "status": "ok",
+            "item_type": category.item_type,
+            "old_name": old_name,
+            "new_name": new_name,
+        }
+    finally:
+        conn.close()
+
+
+@app.delete("/api/budget/categories")
+async def delete_budget_category(
+    item_type: Literal["income", "expense"],
+    name: str,
+    current_user: dict = Depends(get_current_user),
+):
+    name = name.strip()
+    if not name:
+        raise HTTPException(
+            status_code=422,
+            detail="Название категории не может быть пустым",
+        )
+
+    conn = db()
+    try:
+        user_id = current_user["id"]
+        existing = conn.execute(
+            """
+            SELECT id FROM budget_categories
+            WHERE user_id = ? AND item_type = ? AND name = ?
+            """,
+            (user_id, item_type, name),
+        ).fetchone()
+
+        if not existing:
+            raise HTTPException(
+                status_code=404,
+                detail="Категория не найдена",
+            )
+
+        used = conn.execute(
+            """
+            SELECT 1 FROM budget_items
+            WHERE user_id = ? AND item_type = ? AND category = ?
+            LIMIT 1
+            """,
+            (user_id, item_type, name),
+        ).fetchone()
+
+        if used:
+            raise HTTPException(
+                status_code=409,
+                detail="Категория используется в платежах. Сначала переименуйте её или перенесите платежи.",
+            )
+
+        conn.execute(
+            "DELETE FROM budget_categories WHERE id = ? AND user_id = ?",
+            (existing["id"], user_id),
+        )
+        conn.commit()
+
+        return {"status": "ok", "name": name}
+    finally:
+        conn.close()
 @app.get("/api/budget/summary")
 async def budget_summary(
     year: int | None = None,
