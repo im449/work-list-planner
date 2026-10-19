@@ -25,6 +25,7 @@ jobs:
       - name: Run tests
         env:
           SECRET_KEY: test-secret-key
+          TOTP_ENCRYPTION_KEY: MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=
           DB_PATH: ":memory:"
         run: pytest tests/ -v
 
