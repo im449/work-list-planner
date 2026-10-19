@@ -219,7 +219,12 @@ function renderCategoryOptions(selected = "") {
   const type = $("item-type").value;
   const select = $("category");
   const names = budgetCategories[type] || [];
-  const values = [...names];
+  const values = [...names].sort((a, b) => {
+    const aOther = a.trim().toLocaleLowerCase("ru-RU") === "другое";
+    const bOther = b.trim().toLocaleLowerCase("ru-RU") === "другое";
+    if (aOther !== bOther) return aOther ? 1 : -1;
+    return a.localeCompare(b, "ru", { sensitivity: "base" });
+  });
   if (selected && !values.some(name => name.toLowerCase() === selected.toLowerCase())) {
     values.unshift(selected);
   }
@@ -358,21 +363,31 @@ async function handleAuth() {
     return;
   }
   try {
-    const response = await fetch(isRegisterMode ? '/register' : '/token', {
-      method:'POST',
-      headers:{'Content-Type':'application/x-www-form-urlencoded'},
-      body:'username='+encodeURIComponent(username)+'&password='+encodeURIComponent(password)
+    const url = isRegisterMode ? '/register' : '/token';
+    const send = (extra = {}) => fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type':'application/x-www-form-urlencoded'},
+      body: new URLSearchParams({username, password, ...extra})
     });
-    const data = await response.json();
+    let response = await send();
+    let data = await response.json();
+    if (!response.ok && !isRegisterMode &&
+        data.detail === 'Требуется TOTP-код или резервный код') {
+      const code = prompt('Введите код приложения-аутентификатора или резервный код:');
+      if (!code) return;
+      response = await send(/^\\d{6}$/.test(code.trim())
+        ? {totp_code: code.trim()} : {recovery_code: code.trim()});
+      data = await response.json();
+    }
     if (!response.ok) throw new Error(data.detail || 'Ошибка авторизации');
     if (isRegisterMode) {
       alert('Аккаунт создан. Теперь войдите.');
       toggleMode();
       return;
     }
-    localStorage.setItem('auth_token',data.access_token);
-    localStorage.setItem('username',username);
-    $('current-user').textContent = 'Вы: '+username;
+    localStorage.setItem('auth_token', data.access_token);
+    localStorage.setItem('username', username);
+    $('current-user').textContent = 'Вы: ' + username;
     hideLoginScreen();
     await loadAll();
   } catch (error) {

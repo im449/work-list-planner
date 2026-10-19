@@ -49,18 +49,37 @@ const tokenKey = 'adminToken';
 function getToken(){ return localStorage.getItem(tokenKey); }
 
 async function login(){
-  const r = await fetch(API + '/token', {
+  const send = (extra = {}) => fetch(API + '/token', {
     method: 'POST',
     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body: new URLSearchParams({username: username.value, password: password.value})
+    body: new URLSearchParams({
+      username: username.value,
+      password: password.value,
+      ...extra
+    })
   });
-  if (!r.ok){ loginErr.textContent = 'Неверный логин или пароль'; return; }
-  const d = await r.json();
-  localStorage.setItem(tokenKey, d.access_token);
-  username.value = password.value = loginErr.textContent = '';
-  load();
-}
 
+  try {
+    let r = await send();
+    let data = await r.json();
+    if (!r.ok && data.detail === 'Требуется TOTP-код или резервный код') {
+      const code = prompt('Введите код приложения-аутентификатора или резервный код:');
+      if (!code) return;
+      r = await send(/^\\d{6}$/.test(code.trim())
+        ? {totp_code: code.trim()} : {recovery_code: code.trim()});
+      data = await r.json();
+    }
+    if (!r.ok) {
+      loginErr.textContent = data.detail || 'Ошибка входа';
+      return;
+    }
+    localStorage.setItem(tokenKey, data.access_token);
+    username.value = password.value = loginErr.textContent = '';
+    load();
+  } catch (e) {
+    loginErr.textContent = 'Ошибка соединения с сервером';
+  }
+}
 function logout(){ localStorage.removeItem(tokenKey); location.reload(); }
 
 async function loadRegistrationSetting(){

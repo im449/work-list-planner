@@ -118,6 +118,7 @@
     <a href="/budget.html" style="color:#2563EB; text-decoration:none; margin-right:16px; font-weight:600;">📊 Годовой бюджет</a>
     <span id="current-user"></span>
     <button class="btn-logout" onclick="togglePasswordForm()">Сменить пароль</button>
+    <button class="btn-logout" onclick="toggleTotpPanel()">🔐 Двухфакторная защита</button>
     <button class="btn-logout" onclick="logout()">Выйти</button>
   </div>
   <div id="password-panel" class="form-block" style="display:none; max-width:360px; margin:10px 0 16px auto;">
@@ -129,6 +130,30 @@
     <div id="password-message" style="margin-top:8px; font-size:13px;"></div>
   </div>
 </div>
+
+  <div id="totp-panel" class="form-block" style="display:none; max-width:460px; margin:12px 16px 16px auto;">
+    <h3>Двухфакторная защита</h3>
+    <p>1. Введите текущий пароль, чтобы начать подключение.</p>
+    <input id="totp-current-password" type="password" autocomplete="current-password" placeholder="Текущий пароль">
+    <button type="button" id="totp-start-btn" onclick="startTotpSetup()">Создать QR-код</button>
+    <div id="totp-setup-area" style="display:none; margin-top:14px;">
+      <p>2. Отсканируйте QR-код приложением-аутентификатором.</p>
+      <img id="totp-qr" alt="QR-код для настройки 2FA" style="display:block; max-width:220px; width:100%; margin:12px auto;">
+      <p>Если QR-код не сканируется, введите этот ключ вручную:</p>
+      <code id="totp-secret" style="overflow-wrap:anywhere; user-select:all;"></code>
+      <p style="margin-top:16px;">3. Введите шестизначный код из приложения.</p>
+      <input id="totp-confirm-code" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="123456">
+      <button type="button" id="totp-confirm-btn" onclick="confirmTotpSetup()">Подтвердить и включить</button>
+    </div>
+    <div id="totp-message" role="status" style="margin-top:10px; overflow-wrap:anywhere;"></div>
+    <div id="totp-recovery-area" style="display:none; margin-top:14px;">
+      <h4>Резервные коды</h4>
+      <p>Сохраните их сейчас в надёжном месте. Каждый код можно использовать только один раз. Повторно эти коды не показываются.</p>
+      <pre id="totp-recovery-codes" style="white-space:pre-wrap; user-select:all; padding:12px; background:#f3f4f6; border-radius:6px;"></pre>
+      <button type="button" onclick="copyTotpRecoveryCodes()">Копировать резервные коды</button>
+      <p>После сохранения выйдите из аккаунта и войдите снова с кодом из приложения.</p>
+    </div>
+  </div>
 
   <div class="layout">
     <div class="sidebar">
@@ -211,11 +236,24 @@ async function handleAuth() {
   const url = isRegisterMode ? '/register' : '/token';
 
   try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: 'username=' + encodeURIComponent(username) + '&password=' + encodeURIComponent(password)
-    });
+    const body = new URLSearchParams({username, password});
+  const options = {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body
+  };
+  let res = await fetch(url, options);
+
+  if (!isRegisterMode && res.status === 401) {
+    const detail = (await res.clone().json().catch(() => ({}))).detail || '';
+    if (detail === 'Требуется TOTP-код или резервный код') {
+      const code = prompt('Введите код 2FA или резервный код');
+      if (!code || !code.trim()) throw new Error('Вход отменён');
+      const value = code.trim();
+      body.set(/^\d{6}$/.test(value) ? 'totp_code' : 'recovery_code', value);
+      res = await fetch(url, options);
+    }
+  }
 
     if (!res.ok) {
       let msg = 'Ошибка сервера';
@@ -323,6 +361,111 @@ async function changePassword() {
   } finally {
     button.disabled = false;
     button.innerText = 'Изменить пароль';
+  }
+}
+
+function toggleTotpPanel() {
+  const panel = document.getElementById('totp-panel');
+  const opening = panel.style.display === 'none';
+  panel.style.display = opening ? 'block' : 'none';
+  if (opening) {
+    document.getElementById('totp-message').innerText = '';
+  }
+}
+
+async function startTotpSetup() {
+  const message = document.getElementById('totp-message');
+  const password = document.getElementById('totp-current-password').value;
+  const button = document.getElementById('totp-start-btn');
+
+  message.style.color = '#dc3545';
+  if (!password) {
+    message.innerText = 'Введите текущий пароль.';
+    return;
+  }
+
+  button.disabled = true;
+  button.innerText = 'Подготовка...';
+
+  try {
+    const res = await fetch('/users/me/2fa/setup', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({current_password: password})
+    });
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      throw new Error(typeof data.detail === 'string' ? data.detail : 'Не удалось начать настройку 2FA.');
+    }
+
+    document.getElementById('totp-qr').src = data.qr_code;
+    document.getElementById('totp-secret').innerText = data.secret;
+    document.getElementById('totp-setup-area').style.display = 'block';
+    document.getElementById('totp-recovery-area').style.display = 'none';
+    message.style.color = '#198754';
+    message.innerText = data.message || 'QR-код создан. Добавьте его в приложение и введите код.';
+  } catch (err) {
+    message.innerText = err.message || 'Ошибка настройки 2FA.';
+  } finally {
+    button.disabled = false;
+    button.innerText = 'Создать QR-код';
+  }
+}
+
+async function confirmTotpSetup() {
+  const message = document.getElementById('totp-message');
+  const code = document.getElementById('totp-confirm-code').value.trim();
+  const button = document.getElementById('totp-confirm-btn');
+
+  message.style.color = '#dc3545';
+  if (!/^\d{6}$/.test(code)) {
+    message.innerText = 'Введите шестизначный код из приложения.';
+    return;
+  }
+
+  button.disabled = true;
+  button.innerText = 'Проверка...';
+
+  try {
+    const res = await fetch('/users/me/2fa/confirm', {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({code: code})
+    });
+    const data = await res.json().catch(() => ({}));
+
+    if (!res.ok) {
+      throw new Error(typeof data.detail === 'string' ? data.detail : 'Не удалось подтвердить код.');
+    }
+
+    document.getElementById('totp-recovery-codes').innerText =
+      Array.isArray(data.recovery_codes) ? data.recovery_codes.join('\n') : '';
+    document.getElementById('totp-recovery-area').style.display = 'block';
+    document.getElementById('totp-setup-area').style.display = 'none';
+    document.getElementById('totp-current-password').value = '';
+    document.getElementById('totp-confirm-code').value = '';
+    message.style.color = '#198754';
+    message.innerText = 'Двухфакторная защита включена. Сначала сохраните резервные коды.';
+    button.innerText = 'Защита включена';
+  } catch (err) {
+    message.innerText = err.message || 'Ошибка подтверждения 2FA.';
+    button.disabled = false;
+    button.innerText = 'Подтвердить и включить';
+  }
+}
+
+async function copyTotpRecoveryCodes() {
+  const codes = document.getElementById('totp-recovery-codes').innerText;
+  const message = document.getElementById('totp-message');
+
+  try {
+    await navigator.clipboard.writeText(codes);
+    message.style.color = '#198754';
+    message.innerText = 'Резервные коды скопированы. Сохраните их в надёжном месте.';
+  } catch (err) {
+    message.style.color = '#dc3545';
+    message.innerText = 'Автокопирование недоступно. Выделите и скопируйте коды вручную.';
   }
 }
 

@@ -1,5 +1,8 @@
+import json
+import pyotp
+import uuid
 from fastapi.testclient import TestClient
-from main import app, limiter, db
+from main import app, limiter, db, encrypt_totp_secret, hash_recovery_code
 
 # Отключаем rate limit только в отдельном процессе тестов.
 # В работающем production-процессе эта настройка не меняется.
@@ -1160,3 +1163,87 @@ def test_budget_category_delete_checks_usage():
     ).json()
     assert used_name in categories["expense"]
     assert empty_name not in categories["expense"]
+
+
+def _create_2fa_test_user():
+    username = "test2fa_" + uuid.uuid4().hex[:12]
+    password = "pass12345"
+
+    response = client.post(
+        "/register",
+        data={"username": username, "password": password},
+    )
+    assert response.status_code == 200, response.text
+
+    secret = pyotp.random_base32()
+    recovery_code = "A1B2C3D4-E5F60708"
+
+    conn = db()
+    try:
+        conn.execute(
+            """UPDATE users
+               SET totp_enabled = 1,
+                   totp_secret = ?,
+                   recovery_codes_hashes = ?
+               WHERE username = ?""",
+            (
+                encrypt_totp_secret(secret),
+                json.dumps([hash_recovery_code(recovery_code)]),
+                username,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return username, password, secret, recovery_code
+
+
+def test_2fa_login_requires_code():
+    username, password, _, _ = _create_2fa_test_user()
+
+    response = client.post(
+        "/token",
+        data={"username": username, "password": password},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Требуется TOTP-код или резервный код"
+
+
+def test_2fa_login_with_valid_totp():
+    username, password, secret, _ = _create_2fa_test_user()
+    code = pyotp.TOTP(secret).now()
+
+    response = client.post(
+        "/token",
+        data={
+            "username": username,
+            "password": password,
+            "totp_code": code,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["access_token"]
+    assert response.json()["token_type"] == "bearer"
+
+
+def test_2fa_recovery_code_can_be_used_only_once():
+    username, password, _, recovery_code = _create_2fa_test_user()
+    credentials = {"username": username, "password": password}
+
+    first = client.post(
+        "/token",
+        data={**credentials, "recovery_code": recovery_code},
+    )
+    assert first.status_code == 200, first.text
+
+    second = client.post(
+        "/token",
+        data={**credentials, "recovery_code": recovery_code},
+    )
+    assert second.status_code == 401
+    assert second.json()["detail"] == (
+        "Неверный или уже использованный резервный код"
+    )

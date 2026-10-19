@@ -15,11 +15,29 @@ load_dotenv()
 from datetime import datetime, timedelta, date
 from passlib.context import CryptContext
 from jose import JWTError, jwt
+import base64
+import hashlib
+import io
+import json
+import secrets
+import pyotp
+import qrcode
+from cryptography.fernet import Fernet, InvalidToken
 
 # === НАСТРОЙКИ АВТОРИЗАЦИИ ===
 SECRET_KEY = os.environ.get("SECRET_KEY", "")
 if not SECRET_KEY:
     raise RuntimeError("SECRET_KEY is not set. Check .env / systemd EnvironmentFile")
+
+TOTP_ENCRYPTION_KEY = os.environ.get("TOTP_ENCRYPTION_KEY", "")
+if not TOTP_ENCRYPTION_KEY:
+    raise RuntimeError("TOTP_ENCRYPTION_KEY is not set. Check .env / systemd EnvironmentFile")
+
+try:
+    totp_fernet = Fernet(TOTP_ENCRYPTION_KEY.encode())
+except (ValueError, TypeError) as exc:
+    raise RuntimeError("TOTP_ENCRYPTION_KEY has an invalid Fernet format") from exc
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
@@ -83,6 +101,23 @@ def init_db():
 
     if "token_version" not in user_cols:
         c.execute("ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
+
+    # Поля двухфакторной авторизации.
+    if "totp_secret" not in user_cols:
+        c.execute("ALTER TABLE users ADD COLUMN totp_secret TEXT")
+
+    if "totp_pending_secret" not in user_cols:
+        c.execute("ALTER TABLE users ADD COLUMN totp_pending_secret TEXT")
+
+    if "totp_enabled" not in user_cols:
+        c.execute(
+            "ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0"
+        )
+
+    if "recovery_codes_hashes" not in user_cols:
+        c.execute(
+            "ALTER TABLE users ADD COLUMN recovery_codes_hashes TEXT NOT NULL DEFAULT '[]'"
+        )
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS app_settings (
@@ -265,6 +300,50 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+
+def encrypt_totp_secret(secret: str) -> str:
+    """Шифрует TOTP-секрет перед сохранением в БД."""
+    return totp_fernet.encrypt(secret.encode()).decode()
+
+
+def decrypt_totp_secret(encrypted_secret: str) -> str:
+    """Расшифровывает сохранённый TOTP-секрет."""
+    return totp_fernet.decrypt(encrypted_secret.encode()).decode()
+
+
+def verify_totp_code(secret: str, code: str) -> bool:
+    """Проверяет шестизначный TOTP-код с небольшим допуском по времени."""
+    if not code or not code.isdigit() or len(code) != 6:
+        return False
+    return pyotp.TOTP(secret).verify(code, valid_window=1)
+
+
+def make_totp_qr_data_uri(username: str, secret: str) -> str:
+    """Создаёт QR-код для приложения-аутентификатора."""
+    uri = pyotp.TOTP(secret).provisioning_uri(
+        name=username,
+        issuer_name="Work List Planner",
+    )
+    image = qrcode.make(uri)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def hash_recovery_code(code: str) -> str:
+    """Хеширует случайный резервный код перед сохранением."""
+    normalized = code.replace("-", "").replace(" ", "").upper()
+    return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def generate_recovery_codes(count: int = 8) -> list[str]:
+    """Создаёт одноразовые резервные коды высокой энтропии."""
+    return [
+        f"{secrets.token_hex(4).upper()}-{secrets.token_hex(4).upper()}"
+        for _ in range(count)
+    ]
+
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -320,6 +399,109 @@ async def require_admin(user: dict = Depends(get_current_user)):
 class PasswordChange(BaseModel):
     current_password: str = Field(min_length=1)
     new_password: str = Field(min_length=1)
+
+
+class TotpSetupRequest(BaseModel):
+    current_password: str = Field(min_length=1)
+
+
+class TotpCodeRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6)
+
+
+@app.post("/users/me/2fa/setup")
+async def setup_totp(
+    data: TotpSetupRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    conn = db()
+    try:
+        row = conn.execute(
+            "SELECT password_hash, totp_enabled FROM users WHERE id = ?",
+            (current_user["id"],),
+        ).fetchone()
+
+        if not row or not verify_password(data.current_password, row["password_hash"]):
+            raise HTTPException(status_code=400, detail="Неверный текущий пароль")
+
+        if row["totp_enabled"]:
+            raise HTTPException(status_code=409, detail="Двухфакторная авторизация уже включена")
+
+        secret = pyotp.random_base32()
+        encrypted = encrypt_totp_secret(secret)
+
+        conn.execute(
+            "UPDATE users SET totp_pending_secret = ? WHERE id = ?",
+            (encrypted, current_user["id"]),
+        )
+        conn.commit()
+
+        return {
+            "secret": secret,
+            "qr_code": make_totp_qr_data_uri(current_user["username"], secret),
+            "message": "Добавьте аккаунт в приложение-аутентификатор и подтвердите кодом",
+        }
+    finally:
+        conn.close()
+
+
+@app.post("/users/me/2fa/confirm")
+async def confirm_totp(
+    data: TotpCodeRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT totp_pending_secret, totp_enabled FROM users WHERE id = ?",
+            (current_user["id"],),
+        ).fetchone()
+
+        if not row or row["totp_enabled"] or not row["totp_pending_secret"]:
+            raise HTTPException(status_code=400, detail="Сначала начните настройку 2FA")
+
+        try:
+            secret = decrypt_totp_secret(row["totp_pending_secret"])
+        except (InvalidToken, ValueError):
+            raise HTTPException(status_code=500, detail="Не удалось прочитать секрет 2FA")
+
+        if not verify_totp_code(secret, data.code):
+            raise HTTPException(status_code=400, detail="Неверный код подтверждения")
+
+        recovery_codes = generate_recovery_codes()
+        recovery_hashes = json.dumps(
+            [hash_recovery_code(code) for code in recovery_codes]
+        )
+
+        conn.execute(
+            """
+            UPDATE users
+            SET totp_secret = ?,
+                totp_pending_secret = NULL,
+                totp_enabled = 1,
+                recovery_codes_hashes = ?,
+                token_version = token_version + 1
+            WHERE id = ?
+            """,
+            (
+                row["totp_pending_secret"],
+                recovery_hashes,
+                current_user["id"],
+            ),
+        )
+        conn.commit()
+
+        return {
+            "enabled": True,
+            "recovery_codes": recovery_codes,
+            "message": "Сохраните резервные коды в безопасном месте. Повторно они не показываются.",
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 @app.post("/users/me/password")
@@ -385,12 +567,67 @@ async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends
             detail="Неверный логин или пароль",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    form = await request.form()
+    totp_code = (form.get("totp_code") or "").strip()
+    recovery_code = (form.get("recovery_code") or "").strip()
+
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT totp_enabled, totp_secret, recovery_codes_hashes "
+            "FROM users WHERE id = ?",
+            (user["id"],),
+        ).fetchone()
+
+        if row and row["totp_enabled"]:
+            if bool(totp_code) == bool(recovery_code):
+                raise HTTPException(
+                    status_code=401,
+                    detail="Требуется TOTP-код или резервный код",
+                )
+
+            if totp_code:
+                try:
+                    secret = decrypt_totp_secret(row["totp_secret"])
+                except (InvalidToken, AttributeError, TypeError, ValueError):
+                    secret = ""
+
+                if not secret or not verify_totp_code(secret, totp_code):
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Неверный код 2FA",
+                    )
+            else:
+                try:
+                    hashes = json.loads(row["recovery_codes_hashes"] or "[]")
+                except (TypeError, ValueError):
+                    hashes = []
+
+                code_hash = hash_recovery_code(recovery_code)
+                if code_hash not in hashes:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Неверный или уже использованный резервный код",
+                    )
+
+                hashes.remove(code_hash)
+                conn.execute(
+                    "UPDATE users SET recovery_codes_hashes = ? WHERE id = ?",
+                    (json.dumps(hashes), user["id"]),
+                )
+
+        conn.commit()
+    finally:
+        conn.close()
+
     access_token = create_access_token(
         data={"sub": user["username"], "ver": user["token_version"]},
-        expires_delta=access_token_expires
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
     return {"access_token": access_token, "token_type": "bearer"}
+
 
 @app.post("/register")
 @limiter.limit("5/minute")

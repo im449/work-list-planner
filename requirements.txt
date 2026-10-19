@@ -27,3 +27,6 @@ typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.54.0
 wrapt==2.5.0
+pyotp==2.10.0
+qrcode[pil]==8.2
+cryptography==50.0.2

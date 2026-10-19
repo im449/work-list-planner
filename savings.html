@@ -175,21 +175,24 @@ async function handleAuth() {
   }
 
   const url = isRegisterMode ? '/register' : '/token';
+  const send = (extra = {}) => fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+    body: new URLSearchParams({username, password, ...extra})
+  });
 
   try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-      body: 'username=' + encodeURIComponent(username) + '&password=' + encodeURIComponent(password)
-    });
-
-    if (!res.ok) {
-      let msg = 'Ошибка сервера';
-      try { const errData = await res.json(); msg = errData.detail || msg; } catch(e) {}
-      throw new Error(msg);
+    let res = await send();
+    let data = await res.json();
+    if (!res.ok && !isRegisterMode &&
+        data.detail === 'Требуется TOTP-код или резервный код') {
+      const code = prompt('Введите код приложения-аутентификатора или резервный код:');
+      if (!code) return;
+      res = await send(/^\\d{6}$/.test(code.trim())
+        ? {totp_code: code.trim()} : {recovery_code: code.trim()});
+      data = await res.json();
     }
-
-    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || 'Ошибка сервера');
 
     if (isRegisterMode) {
       alert('Пользователь создан. Теперь войдите.');
@@ -206,7 +209,6 @@ async function handleAuth() {
     errorEl.style.display = 'block';
   }
 }
-
 function logout() {
   localStorage.removeItem('auth_token');
   localStorage.removeItem('username');
