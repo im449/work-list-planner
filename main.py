@@ -10,6 +10,11 @@ from fpdf import FPDF
 import os
 import math
 import sqlite3
+import asyncio
+import contextvars
+import time
+import hmac
+import logging
 from dotenv import load_dotenv
 load_dotenv()
 from datetime import datetime, timedelta, date
@@ -58,11 +63,25 @@ app.add_middleware(
 )
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "planner.db"))
+_DEMO_DB_BASE = os.path.dirname(os.path.abspath(DB_PATH if DB_PATH != ":memory:" else __file__))
+DEMO_DB_DIR = os.environ.get("DEMO_DB_DIR", os.path.join(_DEMO_DB_BASE, ".demo_sessions"))
+DEMO_IDLE_TIMEOUT_SECONDS = 120 * 60
+DEMO_MAX_LIFETIME_SECONDS = 24 * 60 * 60
+DEMO_MAX_TASKS = 200
+DEMO_MAX_BUDGET_ITEMS = 500
+DEMO_MAX_CATEGORIES = 50
+DEMO_MAX_SAVINGS_GOALS = 20
+_DEMO_DB_PATH = contextvars.ContextVar("demo_db_path", default=None)
+_demo_cleanup_task = None
+logger = logging.getLogger(__name__)
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
+def db_for_path(path):
+    conn = sqlite3.connect(path, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
+
+def db():
+    return db_for_path(_DEMO_DB_PATH.get() or DB_PATH)
 
 # === ИНИЦИАЛИЗАЦИЯ И МИГРАЦИЯ БАЗЫ ===
 def init_db():
@@ -269,6 +288,17 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_budget_items_user_date
         ON budget_items(user_id, due_date, id)
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS demo_sessions (
+            session_id TEXT PRIMARY KEY,
+            db_path TEXT NOT NULL UNIQUE,
+            ip_hash TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_activity INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL
+        )
+    """)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_demo_sessions_activity ON demo_sessions(last_activity, expires_at)")
     conn.commit()
     conn.close()
 
@@ -352,6 +382,8 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("kind") == "demo":
+            raise credentials_exception
         username: str = payload.get("sub")
         if username is None:
             raise credentials_exception
@@ -390,6 +422,208 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         }
     finally:
         conn.close()
+
+def _safe_demo_db_path(path):
+    if not path:
+        return None
+    root = os.path.realpath(DEMO_DB_DIR)
+    candidate = os.path.realpath(path)
+    try:
+        if os.path.commonpath([root, candidate]) != root or candidate == root:
+            return None
+    except ValueError:
+        return None
+    return candidate
+
+
+def _remove_demo_db(path):
+    safe_path = _safe_demo_db_path(path)
+    if not safe_path:
+        return
+    for suffix in ("", "-wal", "-shm"):
+        try:
+            os.remove(safe_path + suffix)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.exception("Не удалось удалить временную базу демосессии")
+
+
+def _delete_demo_session(session_id):
+    conn = db_for_path(DB_PATH)
+    path = None
+    try:
+        row = conn.execute(
+            "SELECT db_path FROM demo_sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if row:
+            path = row["db_path"]
+            conn.execute("DELETE FROM demo_sessions WHERE session_id = ?", (session_id,))
+            conn.commit()
+    finally:
+        conn.close()
+    if path:
+        _remove_demo_db(path)
+
+
+def _cleanup_expired_demo_sessions():
+    now = int(time.time())
+    conn = db_for_path(DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT session_id, db_path FROM demo_sessions WHERE last_activity <= ? OR expires_at <= ?",
+            (now - DEMO_IDLE_TIMEOUT_SECONDS, now),
+        ).fetchall()
+        if rows:
+            conn.executemany("DELETE FROM demo_sessions WHERE session_id = ?", [(row["session_id"],) for row in rows])
+            conn.commit()
+    finally:
+        conn.close()
+    for row in rows:
+        _remove_demo_db(row["db_path"])
+
+
+def _enforce_demo_record_limit(conn, table, user_id, limit, needed=1):
+    allowed_tables = {"tasks", "budget_items", "budget_categories", "savings_goals"}
+    if table not in allowed_tables:
+        raise RuntimeError("Недопустимая таблица для ограничения демоданных")
+    count = conn.execute(f"SELECT COUNT(*) AS n FROM {table} WHERE user_id = ?", (user_id,)).fetchone()["n"]
+    if count + needed > limit:
+        raise HTTPException(status_code=429, detail=f"В деморежиме достигнут лимит записей ({limit})")
+
+
+@app.post("/api/demo/sessions")
+@limiter.limit("5/10 minutes")
+async def create_demo_session(request: Request):
+    _cleanup_expired_demo_sessions()
+    client_ip = request.client.host if request.client else "unknown"
+    ip_hash = hmac.new(SECRET_KEY.encode("utf-8"), client_ip.encode("utf-8"), hashlib.sha256).hexdigest()
+    now = int(time.time())
+    session_id = secrets.token_urlsafe(32)
+    os.makedirs(DEMO_DB_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(DEMO_DB_DIR, 0o700)
+    except OSError:
+        logger.warning("Не удалось установить права каталога демосессий")
+    db_path = os.path.join(DEMO_DB_DIR, secrets.token_hex(32) + ".sqlite3")
+
+    conn = db_for_path(DB_PATH)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        active = conn.execute(
+            "SELECT COUNT(*) AS n FROM demo_sessions WHERE ip_hash = ? AND last_activity > ? AND expires_at > ?",
+            (ip_hash, now - DEMO_IDLE_TIMEOUT_SECONDS, now),
+        ).fetchone()["n"]
+        if active >= 3:
+            conn.rollback()
+            raise HTTPException(status_code=429, detail="Слишком много активных демосессий с этого адреса. Попробуйте позже.")
+        conn.execute(
+            "INSERT INTO demo_sessions (session_id, db_path, ip_hash, created_at, last_activity, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, db_path, ip_hash, now, now, now + DEMO_MAX_LIFETIME_SECONDS),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    context_token = _DEMO_DB_PATH.set(db_path)
+    try:
+        init_db()
+        try:
+            os.chmod(db_path, 0o600)
+        except OSError:
+            logger.warning("Не удалось установить права файла демобазы")
+    except Exception:
+        _delete_demo_session(session_id)
+        raise
+    finally:
+        _DEMO_DB_PATH.reset(context_token)
+
+    access_token = create_access_token(
+        data={"sub": session_id, "sid": session_id, "kind": "demo"},
+        expires_delta=timedelta(seconds=DEMO_MAX_LIFETIME_SECONDS),
+    )
+    return {"access_token": access_token, "token_type": "bearer", "idle_timeout_seconds": DEMO_IDLE_TIMEOUT_SECONDS, "expires_in": DEMO_MAX_LIFETIME_SECONDS}
+
+
+async def get_app_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(status_code=401, detail="Недействительная или завершённая сессия", headers={"WWW-Authenticate": "Bearer"})
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise credentials_exception
+    if payload.get("kind") != "demo":
+        yield await get_current_user(token)
+        return
+    session_id = payload.get("sid")
+    if not isinstance(session_id, str) or not session_id or payload.get("sub") != session_id:
+        raise credentials_exception
+    now = int(time.time())
+    conn = db_for_path(DB_PATH)
+    try:
+        row = conn.execute("SELECT db_path, last_activity, expires_at FROM demo_sessions WHERE session_id = ?", (session_id,)).fetchone()
+        if not row:
+            raise credentials_exception
+        if now - row["last_activity"] >= DEMO_IDLE_TIMEOUT_SECONDS or now >= row["expires_at"]:
+            expired_path = row["db_path"]
+            conn.execute("DELETE FROM demo_sessions WHERE session_id = ?", (session_id,))
+            conn.commit()
+        else:
+            expired_path = None
+            db_path = _safe_demo_db_path(row["db_path"])
+            if not db_path or not os.path.isfile(db_path):
+                conn.execute("DELETE FROM demo_sessions WHERE session_id = ?", (session_id,))
+                conn.commit()
+                raise credentials_exception
+            conn.execute("UPDATE demo_sessions SET last_activity = ? WHERE session_id = ?", (now, session_id))
+            conn.commit()
+    finally:
+        conn.close()
+    if expired_path:
+        _remove_demo_db(expired_path)
+        raise credentials_exception
+    context_token = _DEMO_DB_PATH.set(db_path)
+    try:
+        yield {"id": 1, "username": "Демо", "role": "demo", "is_demo": True, "demo_session_id": session_id}
+    finally:
+        _DEMO_DB_PATH.reset(context_token)
+
+
+@app.delete("/api/demo/sessions/current")
+async def end_demo_session(current_user: dict = Depends(get_app_user)):
+    if not current_user.get("is_demo"):
+        raise HTTPException(status_code=403, detail="Этот маршрут доступен только демосессии")
+    _delete_demo_session(current_user["demo_session_id"])
+    return {"status": "ended"}
+
+
+async def _demo_cleanup_loop():
+    while True:
+        await asyncio.sleep(300)
+        try:
+            _cleanup_expired_demo_sessions()
+        except Exception:
+            logger.exception("Ошибка фоновой очистки демосессий")
+
+
+@app.on_event("startup")
+async def start_demo_cleanup():
+    global _demo_cleanup_task
+    if _demo_cleanup_task is None or _demo_cleanup_task.done():
+        _demo_cleanup_task = asyncio.create_task(_demo_cleanup_loop())
+
+
+@app.on_event("shutdown")
+async def stop_demo_cleanup():
+    global _demo_cleanup_task
+    if _demo_cleanup_task is not None:
+        _demo_cleanup_task.cancel()
+        try:
+            await _demo_cleanup_task
+        except asyncio.CancelledError:
+            pass
+        _demo_cleanup_task = None
+
 
 async def require_admin(user: dict = Depends(get_current_user)):
     if user["role"] != "admin":
@@ -682,7 +916,7 @@ async def budget_page():
 
 
 @app.get("/tasks")
-async def get_tasks(archived: bool = False, current_user: dict = Depends(get_current_user)):
+async def get_tasks(archived: bool = False, current_user: dict = Depends(get_app_user)):
     conn = db()
     rows = conn.execute(
         "SELECT id, title, due_date, status, description FROM tasks WHERE user_id = ? AND archived = ? ORDER BY id DESC",
@@ -698,13 +932,15 @@ async def get_tasks(archived: bool = False, current_user: dict = Depends(get_cur
     } for r in rows]
 
 @app.post("/tasks")
-async def create_task(task: dict, current_user: dict = Depends(get_current_user)):
+async def create_task(task: dict, current_user: dict = Depends(get_app_user)):
     title = task.get("title")
     if not title:
         raise HTTPException(status_code=400, detail="Title is required")
     due_date = task.get("dueDate", "")
     description = task.get("description", "")
     conn = db()
+    if current_user.get("is_demo"):
+        _enforce_demo_record_limit(conn, "tasks", current_user["id"], DEMO_MAX_TASKS)
     cur = conn.execute(
         "INSERT INTO tasks (title, due_date, status, description, user_id) VALUES (?, ?, ?, ?, ?)",
         (title, due_date, "todo", description, current_user["id"])
@@ -718,7 +954,7 @@ async def create_task(task: dict, current_user: dict = Depends(get_current_user)
 async def update_task(
     task_id: int,
     data: TaskUpdate,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_app_user)
 ):
     conn = db()
     row = conn.execute(
@@ -762,7 +998,7 @@ async def update_task(
     return {"status": "ok"}
 
 @app.delete("/tasks/{task_id}")
-async def delete_task(task_id: int, current_user: dict = Depends(get_current_user)):
+async def delete_task(task_id: int, current_user: dict = Depends(get_app_user)):
     conn = db()
     conn.execute("DELETE FROM tasks WHERE id = ? AND user_id = ?", (task_id, current_user["id"]))
     conn.commit()
@@ -771,7 +1007,7 @@ async def delete_task(task_id: int, current_user: dict = Depends(get_current_use
 
 # === АРХИВ ===
 @app.post("/tasks/archive-done")
-async def archive_done_tasks(current_user: dict = Depends(get_current_user)):
+async def archive_done_tasks(current_user: dict = Depends(get_app_user)):
     conn = db()
     cur = conn.execute(
         "UPDATE tasks SET archived = 1 WHERE user_id = ? AND status = 'done' AND archived = 0",
@@ -783,7 +1019,7 @@ async def archive_done_tasks(current_user: dict = Depends(get_current_user)):
     return {"status": "ok", "archived": count}
 
 @app.post("/tasks/{task_id}/archive")
-async def archive_task(task_id: int, current_user: dict = Depends(get_current_user)):
+async def archive_task(task_id: int, current_user: dict = Depends(get_app_user)):
     conn = db()
     cur = conn.execute(
         "UPDATE tasks SET archived = 1 WHERE id = ? AND user_id = ?",
@@ -796,7 +1032,7 @@ async def archive_task(task_id: int, current_user: dict = Depends(get_current_us
     return {"status": "ok"}
 
 @app.post("/tasks/{task_id}/restore")
-async def restore_task(task_id: int, current_user: dict = Depends(get_current_user)):
+async def restore_task(task_id: int, current_user: dict = Depends(get_app_user)):
     conn = db()
     cur = conn.execute(
         "UPDATE tasks SET archived = 0 WHERE id = ? AND user_id = ?",
@@ -949,7 +1185,7 @@ class PDFWithCyrillic(FPDF):
 
 
 @app.post("/tasks/report")
-async def generate_report(request: Request, current_user: dict = Depends(get_current_user)):
+async def generate_report(request: Request, current_user: dict = Depends(get_app_user)):
     conn = db()
     try:
         rows = conn.execute(
@@ -1170,7 +1406,7 @@ def _goal_payload(row):
 @app.get("/api/savings/goals")
 async def get_savings_goals(
     archived: bool = False,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_app_user)
 ):
     conn = db()
     try:
@@ -1191,12 +1427,14 @@ async def get_savings_goals(
 @app.post("/api/savings/goals")
 async def create_savings_goal(
     item: dict,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_app_user)
 ):
     name, goal, days = _parse_savings_goal(item)
     start_date, end_date, days = _parse_savings_date_range(item, None, days)
     conn = db()
     try:
+        if current_user.get("is_demo"):
+            _enforce_demo_record_limit(conn, "savings_goals", current_user["id"], DEMO_MAX_SAVINGS_GOALS)
         cursor = conn.execute(
             "INSERT INTO savings_goals (user_id, name, goal, days, start_date, end_date, created_date_known, calendar_configured) "
             "VALUES (?, ?, ?, ?, ?, ?, 1, 1)",
@@ -1216,7 +1454,7 @@ async def create_savings_goal(
 async def rename_savings_goal(
     goal_id: int,
     item: dict,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_app_user)
 ):
     conn = db()
     try:
@@ -1242,7 +1480,7 @@ async def rename_savings_goal(
 @app.post("/api/savings/goals/{goal_id}/archive")
 async def archive_savings_goal(
     goal_id: int,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_app_user)
 ):
     """Archive a goal. If it is the last active goal, create a fresh empty replacement."""
     conn = db()
@@ -1279,7 +1517,7 @@ async def archive_savings_goal(
 @app.post("/api/savings/goals/{goal_id}/restore")
 async def restore_savings_goal(
     goal_id: int,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_app_user)
 ):
     conn = db()
     try:
@@ -1307,7 +1545,7 @@ async def restore_savings_goal(
 @app.delete("/api/savings/goals/{goal_id}")
 async def delete_savings_goal(
     goal_id: int,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_app_user)
 ):
     """Permanently delete a goal and its entries; never leave the user without an active goal."""
     conn = db()
@@ -1343,7 +1581,7 @@ async def delete_savings_goal(
 
 
 @app.get("/api/savings/summary")
-async def get_savings_summary(current_user: dict = Depends(get_current_user)):
+async def get_savings_summary(current_user: dict = Depends(get_app_user)):
     conn = db()
     try:
         rows = conn.execute("""
@@ -1389,7 +1627,7 @@ async def get_savings_summary(current_user: dict = Depends(get_current_user)):
 @app.get("/api/savings/settings")
 async def get_savings_settings(
     goal_id: int | None = None,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_app_user)
 ):
     conn = db()
     try:
@@ -1408,7 +1646,7 @@ async def get_savings_settings(
 async def update_savings_settings(
     item: dict,
     goal_id: int | None = None,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_app_user)
 ):
     conn = db()
     try:
@@ -1430,7 +1668,7 @@ async def update_savings_settings(
 @app.get("/api/savings")
 async def get_savings(
     goal_id: int | None = None,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_app_user)
 ):
     conn = db()
     try:
@@ -1461,7 +1699,7 @@ async def update_saving(
     day: int,
     item: dict,
     goal_id: int | None = None,
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_app_user)
 ):
     if day < 1 or day > 3650:
         raise HTTPException(status_code=400, detail="Некорректный номер дня")
@@ -1531,7 +1769,7 @@ def _budget_item_dict(row):
 @app.get("/api/budget/items")
 async def list_budget_items(
     year: int | None = None,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_app_user),
 ):
     if year is None:
         year = date.today().year
@@ -1562,7 +1800,7 @@ async def list_budget_items(
 @app.post("/api/budget/items")
 async def create_budget_item(
     item: BudgetItemCreate,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_app_user),
 ):
     title = item.title.strip()
     category = item.category.strip()
@@ -1573,8 +1811,10 @@ async def create_budget_item(
 
     conn = db()
     try:
-        created_ids = []
         months = range(1, 13) if item.repeat_monthly else [item.due_date.month]
+        if current_user.get("is_demo"):
+            _enforce_demo_record_limit(conn, "budget_items", current_user["id"], DEMO_MAX_BUDGET_ITEMS, needed=len(months))
+        created_ids = []
 
         for month in months:
             if item.repeat_monthly:
@@ -1640,7 +1880,7 @@ async def create_budget_item(
 async def update_budget_item(
     item_id: int,
     item: BudgetItemUpdate,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_app_user),
 ):
     changes = item.dict(exclude_unset=True)
     if not changes:
@@ -1716,7 +1956,7 @@ async def update_budget_item(
 @app.delete("/api/budget/items/{item_id}")
 async def delete_budget_item(
     item_id: int,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_app_user),
 ):
     conn = db()
     try:
@@ -1772,7 +2012,7 @@ BUDGET_DEFAULT_CATEGORIES = {
 
 @app.get("/api/budget/categories")
 async def list_budget_categories(
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_app_user),
 ):
     conn = db()
     try:
@@ -1809,7 +2049,7 @@ async def list_budget_categories(
 @app.post("/api/budget/categories", status_code=201)
 async def create_budget_category(
     category: BudgetCategoryCreate,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_app_user),
 ):
     name = category.name.strip()
     if not name:
@@ -1820,6 +2060,8 @@ async def create_budget_category(
 
     conn = db()
     try:
+        if current_user.get("is_demo"):
+            _enforce_demo_record_limit(conn, "budget_categories", current_user["id"], DEMO_MAX_CATEGORIES)
         try:
             conn.execute(
                 """
@@ -1847,7 +2089,7 @@ class BudgetCategoryRename(BaseModel):
 @app.patch("/api/budget/categories")
 async def rename_budget_category(
     category: BudgetCategoryRename,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_app_user),
 ):
     old_name = category.old_name.strip()
     new_name = category.new_name.strip()
@@ -1927,7 +2169,7 @@ async def rename_budget_category(
 async def delete_budget_category(
     item_type: Literal["income", "expense"],
     name: str,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_app_user),
 ):
     name = name.strip()
     if not name:
@@ -1980,7 +2222,7 @@ async def delete_budget_category(
 @app.get("/api/budget/summary")
 async def budget_summary(
     year: int | None = None,
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(get_app_user),
 ):
     if year is None:
         year = date.today().year
