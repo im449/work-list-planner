@@ -85,6 +85,7 @@ tbody tr.selected{background:#eff6ff}
     <input id="auth-username" autocomplete="username" placeholder="Логин">
     <input id="auth-password" type="password" autocomplete="current-password" placeholder="Пароль">
     <button id="auth-btn" onclick="handleAuth()">Войти</button>
+      <button id="demo-start-btn" type="button" onclick="startDemoSession()" style="margin-top:10px;background:#15803d;">Попробовать демо без регистрации</button>
     <div id="auth-error" style="color:#dc2626;margin-top:10px;font-size:13px"></div>
     <div class="switch-mode" onclick="toggleMode()">Регистрация</div>
   </div>
@@ -361,9 +362,10 @@ function clearMessage() {
   $('message').textContent = '';
 }
 function getAuthHeaders() {
+  const token = sessionStorage.getItem('demo_token') || localStorage.getItem('auth_token');
   return {
     'Content-Type':'application/json',
-    'Authorization':'Bearer ' + (localStorage.getItem('auth_token') || '')
+    'Authorization':'Bearer ' + (token || '')
   };
 }
 function showLoginScreen() { $('login-screen').style.display = 'flex'; }
@@ -407,6 +409,7 @@ async function handleAuth() {
       toggleMode();
       return;
     }
+    sessionStorage.removeItem('demo_token');
     localStorage.setItem('auth_token', data.access_token);
     localStorage.setItem('username', username);
     $('current-user').textContent = 'Вы: ' + username;
@@ -416,11 +419,37 @@ async function handleAuth() {
     $('auth-error').textContent = error.message || 'Ошибка авторизации';
   }
 }
-function logout() {
+async function startDemoSession() {
+  const button = document.getElementById('demo-start-btn');
+  const errorEl = document.getElementById('auth-error');
+  if (button) { button.disabled = true; button.textContent = 'Создаём демосессию...'; }
+  if (errorEl) { errorEl.textContent = ''; errorEl.style.display = 'none'; }
+  try {
+    const response = await fetch('/api/demo/sessions', { method: 'POST' });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.detail || 'Не удалось запустить деморежим');
+    sessionStorage.setItem('demo_token', data.access_token);
+    location.reload();
+  } catch (error) {
+    if (errorEl) {
+      errorEl.textContent = error.message || 'Ошибка запуска деморежима';
+      errorEl.style.display = 'block';
+    }
+    if (button) { button.disabled = false; button.textContent = 'Попробовать демо без регистрации'; }
+  }
+}
+
+async function logout() {
+  const demoToken = sessionStorage.getItem('demo_token');
+  if (demoToken) {
+    try { await fetch('/api/demo/sessions/current', {method:'DELETE',headers:{'Authorization':'Bearer '+demoToken}}); } catch (_) {}
+    sessionStorage.removeItem('demo_token');
+    location.reload();
+    return;
+  }
   localStorage.removeItem('auth_token');
   localStorage.removeItem('username');
-  $('current-user').textContent = '';
-  showLoginScreen();
+  location.reload();
 }
 async function apiJson(url, options={}) {
   const response = await fetch(url,{
@@ -428,7 +457,8 @@ async function apiJson(url, options={}) {
     headers:{...getAuthHeaders(),...(options.headers || {})}
   });
   if (response.status === 401) {
-    localStorage.removeItem('auth_token');
+    if (sessionStorage.getItem('demo_token')) sessionStorage.removeItem('demo_token');
+    else localStorage.removeItem('auth_token');
     showLoginScreen();
     throw new Error('Сессия завершена. Войдите снова.');
   }
@@ -739,9 +769,11 @@ async function deleteItem(id) {
 }
 $('year').value = new Date().getFullYear();
 $('due-date').value = new Date().toLocaleDateString('sv-SE');
-$('current-user').textContent = localStorage.getItem('username')
-  ? 'Вы: '+localStorage.getItem('username') : '';
-if (localStorage.getItem('auth_token')) {
+const demoToken = sessionStorage.getItem('demo_token');
+$('current-user').textContent = demoToken
+  ? 'Демо-режим'
+  : (localStorage.getItem('username') ? 'Вы: '+localStorage.getItem('username') : '');
+if (demoToken || localStorage.getItem('auth_token')) {
   hideLoginScreen();
   loadAll();
 } else {
