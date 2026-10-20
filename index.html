@@ -535,7 +535,12 @@ async function loadTasks() {
     var url = archiveMode ? '/tasks?archived=true' : '/tasks';
     var res = await fetch(url, { headers: getAuthHeaders() });
     if (res.status === 401) {
-      localStorage.removeItem('auth_token');
+      if (sessionStorage.getItem('demo_token')) {
+        sessionStorage.removeItem('demo_token');
+        sessionStorage.setItem('demo_ended', '1');
+      } else {
+        localStorage.removeItem('auth_token');
+      }
       showLoginScreen();
       return;
     }
