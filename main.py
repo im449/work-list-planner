@@ -15,6 +15,7 @@ import contextvars
 import time
 import hmac
 import logging
+import tempfile
 from dotenv import load_dotenv
 load_dotenv()
 from datetime import datetime, timedelta, date
@@ -63,8 +64,10 @@ app.add_middleware(
 )
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "planner.db"))
-_DEMO_DB_BASE = os.path.dirname(os.path.abspath(DB_PATH if DB_PATH != ":memory:" else __file__))
-DEMO_DB_DIR = os.environ.get("DEMO_DB_DIR", os.path.join(_DEMO_DB_BASE, ".demo_sessions"))
+DEMO_DB_DIR = os.environ.get(
+    "DEMO_DB_DIR",
+    os.path.join(tempfile.gettempdir(), f"work-list-planner-demo-{getattr(os, 'getuid', lambda: 0)()}"),
+)
 DEMO_IDLE_TIMEOUT_SECONDS = 120 * 60
 DEMO_MAX_LIFETIME_SECONDS = 24 * 60 * 60
 DEMO_MAX_TASKS = 200
