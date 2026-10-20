@@ -220,6 +220,7 @@ async function startDemoSession() {
     const response = await fetch('/api/demo/sessions', { method: 'POST' });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.detail || 'Не удалось запустить деморежим');
+    sessionStorage.removeItem('demo_ended');
     sessionStorage.setItem('demo_token', data.access_token);
     location.reload();
   } catch (error) {
@@ -241,6 +242,7 @@ async function logout() {
       });
     } catch (_) {}
     sessionStorage.removeItem('demo_token');
+    sessionStorage.setItem('demo_ended', '1');
     location.reload();
     return;
   }
@@ -320,8 +322,10 @@ async function apiJson(url, options = {}) {
   });
 
   if (response.status === 401) {
-    if (sessionStorage.getItem('demo_token')) sessionStorage.removeItem('demo_token');
-    else localStorage.removeItem('auth_token');
+    if (sessionStorage.getItem('demo_token')) {
+      sessionStorage.removeItem('demo_token');
+      sessionStorage.setItem('demo_ended', '1');
+    } else localStorage.removeItem('auth_token');
     showLoginScreen();
     throw new Error('Сессия завершена. Войдите в приложение снова.');
   }
@@ -694,10 +698,13 @@ document.getElementById('delete-archived-goal-btn').addEventListener('click', as
 
 // --- Старт страницы ---
 const demoToken = sessionStorage.getItem('demo_token');
+const demoEnded = sessionStorage.getItem('demo_ended') === '1';
 const savedToken = localStorage.getItem('auth_token');
 const savedUsername = localStorage.getItem('username');
 
-if (demoToken) {
+if (demoEnded) {
+  showLoginScreen();
+} else if (demoToken) {
   document.getElementById('current-user').innerText = 'Демо-режим';
   hideLoginScreen();
   loadSavings();
