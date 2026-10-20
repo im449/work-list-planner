@@ -190,3 +190,48 @@ def test_demo_task_record_limit(demo_client):
 
     response = client.post("/tasks", json={"title": "Сверх лимита"}, headers=headers)
     assert response.status_code == 429
+
+
+def test_demo_savings_calendar_entry_limit(demo_client):
+    client, _, _ = demo_client
+    headers = create_demo(client)
+    goals = []
+    for name in ("Копилка 1", "Копилка 2"):
+        response = client.post(
+            "/api/savings/goals",
+            headers=headers,
+            json={
+                "name": name,
+                "goal": 1000,
+                "days": 3650,
+                "start_date": "2026-01-01",
+                "end_date": "2035-12-29",
+            },
+        )
+        assert response.status_code == 200, response.text
+        goals.append(response.json()["id"])
+
+    registry = sqlite3.connect(str(demo_client[1]))
+    try:
+        session_id, db_path = registry.execute(
+            "SELECT session_id, db_path FROM demo_sessions"
+        ).fetchone()
+    finally:
+        registry.close()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executemany(
+            "INSERT INTO savings_goal_entries (goal_id, day, amount, paid) VALUES (?, ?, 0, 0)",
+            [(goal_id, day) for goal_id in goals for day in range(1, 2501)],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    response = client.put(
+        f"/api/savings/2501?goal_id={goals[0]}",
+        headers=headers,
+        json={"amount": 1, "paid": True},
+    )
+    assert response.status_code == 429
