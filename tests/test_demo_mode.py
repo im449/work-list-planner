@@ -116,16 +116,30 @@ def test_demo_session_ends_and_removes_only_its_database(demo_client):
     first = create_demo(client)
     second = create_demo(client)
 
+    from jose import jwt
+
+    first_session_id = jwt.decode(
+        first["Authorization"].removeprefix("Bearer "),
+        main.SECRET_KEY,
+        algorithms=[main.ALGORITHM],
+    )["sid"]
+    second_session_id = jwt.decode(
+        second["Authorization"].removeprefix("Bearer "),
+        main.SECRET_KEY,
+        algorithms=[main.ALGORITHM],
+    )["sid"]
     conn = sqlite3.connect(database_path)
     try:
-        rows = conn.execute(
-            "SELECT session_id, db_path FROM demo_sessions ORDER BY created_at"
-        ).fetchall()
+        first_db = conn.execute(
+            "SELECT db_path FROM demo_sessions WHERE session_id = ?",
+            (first_session_id,),
+        ).fetchone()[0]
+        second_db = conn.execute(
+            "SELECT db_path FROM demo_sessions WHERE session_id = ?",
+            (second_session_id,),
+        ).fetchone()[0]
     finally:
         conn.close()
-    assert len(rows) == 2
-    first_db = rows[0][1]
-    second_db = rows[1][1]
     assert os.path.isfile(first_db)
     assert os.path.isfile(second_db)
 
