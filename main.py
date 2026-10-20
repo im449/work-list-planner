@@ -940,7 +940,11 @@ async def create_task(task: dict, current_user: dict = Depends(get_app_user)):
     description = task.get("description", "")
     conn = db()
     if current_user.get("is_demo"):
-        _enforce_demo_record_limit(conn, "tasks", current_user["id"], DEMO_MAX_TASKS)
+        try:
+            _enforce_demo_record_limit(conn, "tasks", current_user["id"], DEMO_MAX_TASKS)
+        except Exception:
+            conn.close()
+            raise
     cur = conn.execute(
         "INSERT INTO tasks (title, due_date, status, description, user_id) VALUES (?, ?, ?, ?, ?)",
         (title, due_date, "todo", description, current_user["id"])
