@@ -200,6 +200,7 @@ async function handleAuth() {
       toggleMode();
     } else {
       sessionStorage.removeItem('demo_token');
+      sessionStorage.removeItem('demo_ended');
       localStorage.setItem('auth_token', data.access_token);
       localStorage.setItem('username', username);
       document.getElementById('current-user').innerText = 'Вы: ' + username;
