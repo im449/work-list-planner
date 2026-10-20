@@ -440,14 +440,18 @@ def _safe_demo_db_path(path):
 def _remove_demo_db(path):
     safe_path = _safe_demo_db_path(path)
     if not safe_path:
-        return
+        # Never touch a path outside the dedicated demo directory.
+        return True
+    removed = True
     for suffix in ("", "-wal", "-shm"):
         try:
             os.remove(safe_path + suffix)
         except FileNotFoundError:
             pass
         except OSError:
+            removed = False
             logger.exception("Не удалось удалить временную базу демосессии")
+    return removed
 
 
 def _delete_demo_session(session_id):
@@ -460,12 +464,21 @@ def _delete_demo_session(session_id):
         ).fetchone()
         if row:
             path = row["db_path"]
-            conn.execute("DELETE FROM demo_sessions WHERE session_id = ?", (session_id,))
+            # Revoke the token immediately; retain the registry row if cleanup must retry.
+            conn.execute(
+                "UPDATE demo_sessions SET expires_at = 0, last_activity = 0 WHERE session_id = ?",
+                (session_id,),
+            )
             conn.commit()
     finally:
         conn.close()
-    if path:
-        _remove_demo_db(path)
+    if path and _remove_demo_db(path):
+        conn = db_for_path(DB_PATH)
+        try:
+            conn.execute("DELETE FROM demo_sessions WHERE session_id = ?", (session_id,))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def _cleanup_expired_demo_sessions():
@@ -476,13 +489,18 @@ def _cleanup_expired_demo_sessions():
             "SELECT session_id, db_path FROM demo_sessions WHERE last_activity <= ? OR expires_at <= ?",
             (now - DEMO_IDLE_TIMEOUT_SECONDS, now),
         ).fetchall()
-        if rows:
-            conn.executemany("DELETE FROM demo_sessions WHERE session_id = ?", [(row["session_id"],) for row in rows])
-            conn.commit()
     finally:
         conn.close()
+
     for row in rows:
-        _remove_demo_db(row["db_path"])
+        if not _remove_demo_db(row["db_path"]):
+            continue
+        conn = db_for_path(DB_PATH)
+        try:
+            conn.execute("DELETE FROM demo_sessions WHERE session_id = ?", (row["session_id"],))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def _enforce_demo_record_limit(conn, table, user_id, limit, needed=1):
@@ -567,8 +585,6 @@ async def get_app_user(token: str = Depends(oauth2_scheme)):
             raise credentials_exception
         if now - row["last_activity"] >= DEMO_IDLE_TIMEOUT_SECONDS or now >= row["expires_at"]:
             expired_path = row["db_path"]
-            conn.execute("DELETE FROM demo_sessions WHERE session_id = ?", (session_id,))
-            conn.commit()
         else:
             expired_path = None
             db_path = _safe_demo_db_path(row["db_path"])
@@ -581,7 +597,13 @@ async def get_app_user(token: str = Depends(oauth2_scheme)):
     finally:
         conn.close()
     if expired_path:
-        _remove_demo_db(expired_path)
+        if _remove_demo_db(expired_path):
+            cleanup_conn = db_for_path(DB_PATH)
+            try:
+                cleanup_conn.execute("DELETE FROM demo_sessions WHERE session_id = ?", (session_id,))
+                cleanup_conn.commit()
+            finally:
+                cleanup_conn.close()
         raise credentials_exception
     context_token = _DEMO_DB_PATH.set(db_path)
     try:
