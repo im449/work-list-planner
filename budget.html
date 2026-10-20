@@ -399,7 +399,7 @@ async function handleAuth() {
         data.detail === 'Требуется TOTP-код или резервный код') {
       const code = prompt('Введите код приложения-аутентификатора или резервный код:');
       if (!code) return;
-      response = await send(/^\\d{6}$/.test(code.trim())
+      response = await send(/^\d{6}$/.test(code.trim())
         ? {totp_code: code.trim()} : {recovery_code: code.trim()});
       data = await response.json();
     }
