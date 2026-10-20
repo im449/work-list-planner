@@ -1287,6 +1287,10 @@ def _ensure_savings_goal(conn, user_id: int):
     if row:
         return row
 
+    # A demo session must not exceed its savings-goal quota through lazy goal creation.
+    if _DEMO_DB_PATH.get() is not None:
+        _enforce_demo_record_limit(conn, "savings_goals", user_id, DEMO_MAX_SAVINGS_GOALS)
+
     # Preserve settings and daily contributions stored in the legacy single-goal tables.
     legacy_settings = conn.execute(
         "SELECT goal, days FROM savings_settings WHERE user_id = ?", (user_id,)
