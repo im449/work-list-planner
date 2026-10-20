@@ -188,6 +188,24 @@ tbody tr.selected{background:#eff6ff}
         <option value="expense">Расходы</option><option value="income">Доходы</option>
       </select>
     </label>
+    <label style="width:180px">Категория
+      <select id="category-filter" onchange="renderItems()">
+        <option value="all">Все категории</option>
+      </select>
+    </label>
+    <label style="width:160px">С даты
+      <input type="date" id="date-from" onchange="renderItems()">
+    </label>
+    <label style="width:160px">По дату
+      <input type="date" id="date-to" onchange="renderItems()">
+    </label>
+    <label style="width:180px">Статус
+      <select id="status-filter" onchange="renderItems()">
+        <option value="all">Все статусы</option>
+        <option value="paid">Фактические</option>
+        <option value="planned">Запланированные</option>
+      </select>
+    </label>
     <label style="width:180px">Обязательность
       <select id="mandatory-filter" onchange="renderItems()">
         <option value="all">Все операции</option>
@@ -195,6 +213,10 @@ tbody tr.selected{background:#eff6ff}
         <option value="no">Только необязательные расходы</option>
       </select>
     </label>
+  </div>
+  <div id="filter-totals" class="panel" style="margin:12px 0;padding:14px">
+    <strong>Результаты фильтрации</strong>
+    <div id="filter-totals-content" aria-live="polite"></div>
   </div>
   <div id="items-list" class="cards"></div>
 </section>
@@ -493,26 +515,95 @@ function selectMonth(month) {
   renderSummary();
   renderItems();
 }
+function renderCategoryFilter() {
+  const select = $("category-filter");
+  if (!select) return;
+  const previous = select.value || "all";
+  const categories = [...new Set(items.map(item =>
+    String(item.category || "Без категории")
+  ))].sort((a, b) => a.localeCompare(b, "ru", {sensitivity:"base"}));
+
+  select.innerHTML = '<option value="all">Все категории</option>' +
+    categories.map(name =>
+      `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`
+    ).join("");
+
+  select.value = categories.includes(previous) ? previous : "all";
+}
+
 function renderItems() {
+  renderCategoryFilter();
+
   const month = $("month-filter").value;
   const type = $("type-filter").value;
   const mandatory = $("mandatory-filter").value;
+  const category = $("category-filter").value;
+  const dateFrom = $("date-from").value;
+  const dateTo = $("date-to").value;
+  const status = $("status-filter").value;
+
+  if (dateFrom && dateTo && dateFrom > dateTo) {
+    $("filter-totals-content").innerHTML =
+      '<div class="empty" style="margin-top:10px">Укажите корректный период: дата начала не должна быть позже даты окончания.</div>';
+    $("items-list").innerHTML =
+      '<div class="empty">Дата начала периода позже даты окончания. Исправьте даты.</div>';
+    return;
+  }
+
   const filtered = items.filter(item => {
     const itemMonth = String(Number(String(item.due_date).slice(5,7)));
     const matchesMonth = month === "all" || itemMonth === month;
     const matchesType = type === "all" || item.item_type === type;
+    const matchesCategory = category === "all" ||
+      String(item.category || "Без категории") === category;
+    const matchesDateFrom = !dateFrom || item.due_date >= dateFrom;
+    const matchesDateTo = !dateTo || item.due_date <= dateTo;
+    const matchesStatus = status === "all" || item.status === status;
     const matchesMandatory =
       mandatory === "all" ||
       (item.item_type === "expense" && (
         mandatory === "yes" ? Boolean(item.mandatory) : !item.mandatory
       ));
-    return matchesMonth && matchesType && matchesMandatory;
+
+    return matchesMonth && matchesType && matchesCategory &&
+      matchesDateFrom && matchesDateTo && matchesStatus && matchesMandatory;
   }).sort((a,b) => a.due_date.localeCompare(b.due_date) || a.id-b.id);
+
+  const actualIncome = filtered.reduce((sum, item) =>
+    sum + (item.item_type === "income" && item.status === "paid"
+      ? Number(item.amount_kopecks || 0) : 0), 0);
+  const actualExpense = filtered.reduce((sum, item) =>
+    sum + (item.item_type === "expense" && item.status === "paid"
+      ? Number(item.amount_kopecks || 0) : 0), 0);
+  const plannedIncome = filtered.reduce((sum, item) =>
+    sum + (item.item_type === "income" && item.status === "planned"
+      ? Number(item.amount_kopecks || 0) : 0), 0);
+  const plannedExpense = filtered.reduce((sum, item) =>
+    sum + (item.item_type === "expense" && item.status === "planned"
+      ? Number(item.amount_kopecks || 0) : 0), 0);
+
+  $("filter-totals-content").innerHTML = `
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-top:10px">
+      <div><span class="muted">Операций:</span> <strong>${filtered.length}</strong></div>
+      <div><span class="muted">Полученные доходы:</span>
+        <strong class="income">${money(actualIncome)}</strong></div>
+      <div><span class="muted">Оплаченные расходы:</span>
+        <strong class="expense">${money(actualExpense)}</strong></div>
+      <div><span class="muted">Баланс фактических операций:</span>
+        <strong class="${actualIncome-actualExpense<0?'balance-negative':'balance-positive'}">${money(actualIncome-actualExpense)}</strong></div>
+      <div><span class="muted">Ожидаемые доходы:</span>
+        <strong>${money(plannedIncome)}</strong></div>
+      <div><span class="muted">Запланированные расходы:</span>
+        <strong>${money(plannedExpense)}</strong></div>
+    </div>`;
+
   if (!filtered.length) {
-    $('items-list').innerHTML = '<div class="empty">В этом разделе пока нет платежей. Добавьте первую операцию выше.</div>';
+    $("items-list").innerHTML =
+      '<div class="empty">По выбранным фильтрам операций не найдено.</div>';
     return;
   }
-  $('items-list').innerHTML = filtered.map(item => {
+
+  $("items-list").innerHTML = filtered.map(item => {
     const isIncome = item.item_type === 'income';
     const date = new Date(item.due_date+'T12:00:00');
     const dateLabel = Number.isNaN(date.getTime()) ? item.due_date :
