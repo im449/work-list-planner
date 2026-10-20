@@ -288,17 +288,18 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_budget_items_user_date
         ON budget_items(user_id, due_date, id)
     """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS demo_sessions (
-            session_id TEXT PRIMARY KEY,
-            db_path TEXT NOT NULL UNIQUE,
-            ip_hash TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            last_activity INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL
-        )
-    """)
-    c.execute("CREATE INDEX IF NOT EXISTS idx_demo_sessions_activity ON demo_sessions(last_activity, expires_at)")
+    if _DEMO_DB_PATH.get() is None:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS demo_sessions (
+                session_id TEXT PRIMARY KEY,
+                db_path TEXT NOT NULL UNIQUE,
+                ip_hash TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_activity INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )
+        """)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_demo_sessions_activity ON demo_sessions(last_activity, expires_at)")
     conn.commit()
     conn.close()
 
