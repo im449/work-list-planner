@@ -779,7 +779,7 @@ const demoEnded = sessionStorage.getItem('demo_ended') === '1';
 $('current-user').textContent = demoToken
   ? 'Демо-режим'
   : (localStorage.getItem('username') ? 'Вы: '+localStorage.getItem('username') : '');
-if (demoEnded) {
+if (demoEnded && !localStorage.getItem('auth_token') && !demoToken) {
   showLoginScreen();
 } else if (demoToken || localStorage.getItem('auth_token')) {
   hideLoginScreen();
