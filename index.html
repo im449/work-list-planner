@@ -271,6 +271,8 @@ async function handleAuth() {
       alert('Пользователь создан. Теперь войдите.');
       toggleMode();
     } else {
+      sessionStorage.removeItem('demo_token');
+      sessionStorage.removeItem('demo_ended');
       localStorage.setItem('auth_token', data.access_token);
       localStorage.setItem('username', username);
       document.getElementById('current-user').innerText = 'Вы: ' + username;
@@ -321,6 +323,8 @@ async function logout() {
   }
   localStorage.removeItem('auth_token');
   localStorage.removeItem('username');
+  sessionStorage.removeItem('demo_token');
+  sessionStorage.removeItem('demo_ended');
   document.getElementById('current-user').innerText = '';
   location.reload();
 }
@@ -776,7 +780,7 @@ const demoEnded = sessionStorage.getItem('demo_ended') === '1';
 const savedToken = localStorage.getItem('auth_token');
 const savedUsername = localStorage.getItem('username');
 
-if (demoEnded) {
+if (demoEnded && !savedToken && !demoToken) {
   showLoginScreen();
 } else if (demoToken) {
   document.getElementById('current-user').innerText = 'Демо-режим';
