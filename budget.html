@@ -410,6 +410,7 @@ async function handleAuth() {
       return;
     }
     sessionStorage.removeItem('demo_token');
+    sessionStorage.removeItem('demo_ended');
     localStorage.setItem('auth_token', data.access_token);
     localStorage.setItem('username', username);
     $('current-user').textContent = 'Вы: ' + username;
@@ -428,6 +429,7 @@ async function startDemoSession() {
     const response = await fetch('/api/demo/sessions', { method: 'POST' });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.detail || 'Не удалось запустить деморежим');
+    sessionStorage.removeItem('demo_ended');
     sessionStorage.setItem('demo_token', data.access_token);
     location.reload();
   } catch (error) {
@@ -444,6 +446,7 @@ async function logout() {
   if (demoToken) {
     try { await fetch('/api/demo/sessions/current', {method:'DELETE',headers:{'Authorization':'Bearer '+demoToken}}); } catch (_) {}
     sessionStorage.removeItem('demo_token');
+    sessionStorage.setItem('demo_ended', '1');
     location.reload();
     return;
   }
@@ -457,8 +460,10 @@ async function apiJson(url, options={}) {
     headers:{...getAuthHeaders(),...(options.headers || {})}
   });
   if (response.status === 401) {
-    if (sessionStorage.getItem('demo_token')) sessionStorage.removeItem('demo_token');
-    else localStorage.removeItem('auth_token');
+    if (sessionStorage.getItem('demo_token')) {
+      sessionStorage.removeItem('demo_token');
+      sessionStorage.setItem('demo_ended', '1');
+    } else localStorage.removeItem('auth_token');
     showLoginScreen();
     throw new Error('Сессия завершена. Войдите снова.');
   }
@@ -770,10 +775,13 @@ async function deleteItem(id) {
 $('year').value = new Date().getFullYear();
 $('due-date').value = new Date().toLocaleDateString('sv-SE');
 const demoToken = sessionStorage.getItem('demo_token');
+const demoEnded = sessionStorage.getItem('demo_ended') === '1';
 $('current-user').textContent = demoToken
   ? 'Демо-режим'
   : (localStorage.getItem('username') ? 'Вы: '+localStorage.getItem('username') : '');
-if (demoToken || localStorage.getItem('auth_token')) {
+if (demoEnded) {
+  showLoginScreen();
+} else if (demoToken || localStorage.getItem('auth_token')) {
   hideLoginScreen();
   loadAll();
 } else {
