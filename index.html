@@ -293,6 +293,7 @@ async function startDemoSession() {
     const response = await fetch('/api/demo/sessions', { method: 'POST' });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.detail || 'Не удалось запустить деморежим');
+    sessionStorage.removeItem('demo_ended');
     sessionStorage.setItem('demo_token', data.access_token);
     location.reload();
   } catch (error) {
@@ -314,6 +315,7 @@ async function logout() {
       });
     } catch (_) {}
     sessionStorage.removeItem('demo_token');
+    sessionStorage.setItem('demo_ended', '1');
     location.reload();
     return;
   }
@@ -765,10 +767,13 @@ async function loadUserActivity() {
 
 // === Старт страницы ===
 const demoToken = sessionStorage.getItem('demo_token');
+const demoEnded = sessionStorage.getItem('demo_ended') === '1';
 const savedToken = localStorage.getItem('auth_token');
 const savedUsername = localStorage.getItem('username');
 
-if (demoToken) {
+if (demoEnded) {
+  showLoginScreen();
+} else if (demoToken) {
   document.getElementById('current-user').innerText = 'Демо-режим';
   document.getElementById('change-password-btn').style.display = 'none';
   document.getElementById('totp-btn').style.display = 'none';
