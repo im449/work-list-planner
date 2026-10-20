@@ -74,6 +74,7 @@ DEMO_MAX_TASKS = 200
 DEMO_MAX_BUDGET_ITEMS = 500
 DEMO_MAX_CATEGORIES = 50
 DEMO_MAX_SAVINGS_GOALS = 20
+DEMO_MAX_SAVINGS_ENTRIES = 5000
 _DEMO_DB_PATH = contextvars.ContextVar("demo_db_path", default=None)
 _demo_cleanup_task = None
 logger = logging.getLogger(__name__)
@@ -1755,6 +1756,26 @@ async def update_saving(
                 status_code=400,
                 detail=f"День должен быть от 1 до {int(goal['days'])}"
             )
+        if current_user.get("is_demo"):
+            existing_entry = conn.execute(
+                "SELECT 1 FROM savings_goal_entries WHERE goal_id = ? AND day = ?",
+                (goal["id"], day),
+            ).fetchone()
+            if not existing_entry:
+                entry_count = conn.execute(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM savings_goal_entries e
+                    JOIN savings_goals g ON g.id = e.goal_id
+                    WHERE g.user_id = ?
+                    """,
+                    (current_user["id"],),
+                ).fetchone()["n"]
+                if entry_count >= DEMO_MAX_SAVINGS_ENTRIES:
+                    raise HTTPException(
+                        status_code=429,
+                        detail=f"В деморежиме достигнут лимит записей календаря ({DEMO_MAX_SAVINGS_ENTRIES})",
+                    )
         conn.execute(
             "INSERT INTO savings_goal_entries (goal_id, day, amount, paid) VALUES (?, ?, ?, ?) "
             "ON CONFLICT(goal_id, day) DO UPDATE SET amount = excluded.amount, paid = excluded.paid",
