@@ -249,3 +249,16 @@ def test_demo_savings_calendar_entry_limit(demo_client):
         json={"amount": 1, "paid": True},
     )
     assert response.status_code == 429
+
+
+def test_demo_creation_rate_limit(demo_client, monkeypatch):
+    client, _, _ = demo_client
+    monkeypatch.setattr(main.limiter, "enabled", True)
+
+    for _ in range(5):
+        headers = create_demo(client)
+        ended = client.delete("/api/demo/sessions/current", headers=headers)
+        assert ended.status_code == 200, ended.text
+
+    response = client.post("/api/demo/sessions")
+    assert response.status_code == 429
