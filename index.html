@@ -104,7 +104,10 @@
     <div class="auth-box">
       <h2 id="auth-title">Вход</h2>
       <input id="auth-username" placeholder="Логин">
-      <input id="auth-password" type="password" placeholder="Пароль">
+      <input id="auth-password" type="password" autocomplete="current-password" placeholder="Пароль">
+      <div id="auth-2fa-area" style="display:none;">
+        <input id="auth-2fa-code" type="text" inputmode="numeric" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" maxlength="64" placeholder="Код 2FA или резервный код">
+      </div>
       <button id="auth-btn" onclick="handleAuth()">Войти</button>
       <button id="demo-start-btn" type="button" onclick="startDemoSession()" style="margin-top:10px;background:#15803d;">Попробовать демо без регистрации</button>
       <div id="auth-error" class="error"></div>
@@ -235,26 +238,42 @@ async function handleAuth() {
   }
 
   const url = isRegisterMode ? '/register' : '/token';
+  const twoFactorArea = document.getElementById('auth-2fa-area');
+  const twoFactorInput = document.getElementById('auth-2fa-code');
+  const authButton = document.getElementById('auth-btn');
+  const twoFactorRequired = !isRegisterMode && twoFactorArea.style.display !== 'none';
+  const twoFactorCode = twoFactorInput.value.trim();
+
+  if (twoFactorRequired && !twoFactorCode) {
+    errorEl.innerText = 'Введите код 2FA или резервный код';
+    errorEl.style.display = 'block';
+    twoFactorInput.focus();
+    return;
+  }
 
   try {
     const body = new URLSearchParams({username, password});
-  const options = {
-    method: 'POST',
-    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-    body
-  };
-  let res = await fetch(url, options);
-
-  if (!isRegisterMode && res.status === 401) {
-    const detail = (await res.clone().json().catch(() => ({}))).detail || '';
-    if (detail === 'Требуется TOTP-код или резервный код') {
-      const code = prompt('Введите код 2FA или резервный код');
-      if (!code || !code.trim()) throw new Error('Вход отменён');
-      const value = code.trim();
-      body.set(/^\d{6}$/.test(value) ? 'totp_code' : 'recovery_code', value);
-      res = await fetch(url, options);
+    if (twoFactorRequired) {
+      body.set(/^\d{6}$/.test(twoFactorCode) ? 'totp_code' : 'recovery_code', twoFactorCode);
     }
-  }
+    const options = {
+      method: 'POST',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+      body
+    };
+    const res = await fetch(url, options);
+
+    if (!isRegisterMode && res.status === 401) {
+      const detail = (await res.clone().json().catch(() => ({}))).detail || '';
+      if (detail === 'Требуется TOTP-код или резервный код' && !twoFactorRequired) {
+        twoFactorArea.style.display = 'block';
+        authButton.innerText = 'Подтвердить код';
+        errorEl.innerText = 'Введите код из приложения-аутентификатора или резервный код';
+        errorEl.style.display = 'block';
+        twoFactorInput.focus();
+        return;
+      }
+    }
 
     if (!res.ok) {
       let msg = 'Ошибка сервера';
@@ -273,6 +292,9 @@ async function handleAuth() {
     } else {
       sessionStorage.removeItem('demo_token');
       sessionStorage.removeItem('demo_ended');
+      twoFactorArea.style.display = 'none';
+      twoFactorInput.value = '';
+      authButton.innerText = 'Войти';
       localStorage.setItem('auth_token', data.access_token);
       localStorage.setItem('username', username);
       document.getElementById('current-user').innerText = 'Вы: ' + username;
