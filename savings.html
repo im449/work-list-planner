@@ -133,6 +133,29 @@
     </p>
   </div>
 
+  <div id="bulk-panel" class="stats-block" style="margin-top:12px;">
+    <button id="bulk-toggle" type="button" style="padding:9px 14px;cursor:pointer;">
+      Массовое пополнение
+    </button>
+    <div id="bulk-controls" style="display:none;margin-top:12px;gap:12px;flex-wrap:wrap;align-items:end;">
+      <label>Сумма за день, ₽
+        <input id="bulk-amount" type="number" min="0.01" step="0.01" placeholder="200"
+          style="display:block;width:150px;padding:9px;margin-top:4px;">
+      </label>
+      <span>Выбрано дней: <b id="bulk-count">0</b></span>
+      <span>Итого: <b id="bulk-total">0 ₽</b></span>
+      <button id="bulk-apply" type="button" disabled style="padding:9px 14px;cursor:pointer;">
+        Пополнить выбранные
+      </button>
+      <button id="bulk-cancel" type="button" style="padding:9px 14px;cursor:pointer;">
+        Отмена
+      </button>
+      <p style="flex-basis:100%;font-size:13px;color:#666;">
+        Выбирайте неоплаченные дни в календаре. Сумма будет внесена отдельно за каждый выбранный день.
+      </p>
+    </div>
+  </div>
+
   <div class="grid" id="cells-grid">
     <!-- Сюда JS будет вставлять 365 ячеек -->
   </div>
@@ -264,6 +287,17 @@ function getAuthHeaders() {
 let SAVINGS_GOAL = 100000;
 let SAVINGS_DAYS = 365;
 let ACTIVE_SAVINGS_GOAL_ID = null;
+let BULK_SELECTION_MODE = false;
+let BULK_SELECTED_DAYS = new Set();
+
+function updateBulkSummary() {
+  const count = BULK_SELECTED_DAYS.size;
+  const amount = Number(document.getElementById('bulk-amount').value);
+  document.getElementById('bulk-count').innerText = count;
+  document.getElementById('bulk-total').innerText =
+    formatMoney(Number.isFinite(amount) && amount > 0 ? amount * count : 0);
+  document.getElementById('bulk-apply').disabled = count === 0 || !Number.isFinite(amount) || amount <= 0;
+}
 
 function formatMoney(value) {
   return Number(value || 0).toLocaleString('ru-RU', {
@@ -468,6 +502,10 @@ async function loadSavings() {
       const item = byDay.get(d) || { day: d, amount: 0, paid: false };
       const cell = document.createElement('div');
       cell.className = 'cell' + (item.paid ? ' paid' : '');
+      if (BULK_SELECTED_DAYS.has(d)) {
+        cell.style.outline = '3px solid #2563eb';
+        cell.style.outlineOffset = '2px';
+      }
 
       const button = document.createElement('button');
       button.type = 'button';
@@ -485,6 +523,19 @@ async function loadSavings() {
 
       button.append(dayLabel, amountLabel);
       button.addEventListener('click', async () => {
+        if (BULK_SELECTION_MODE) {
+          if (item.paid) return;
+          if (BULK_SELECTED_DAYS.has(d)) {
+            BULK_SELECTED_DAYS.delete(d);
+          } else {
+            BULK_SELECTED_DAYS.add(d);
+          }
+          cell.style.outline = BULK_SELECTED_DAYS.has(d) ? '3px solid #2563eb' : '';
+          cell.style.outlineOffset = BULK_SELECTED_DAYS.has(d) ? '2px' : '';
+          updateBulkSummary();
+          return;
+        }
+
         const initial = item.paid ? String(item.amount) : '';
         const answer = prompt(
           `${cellDate.full} (день ${d}). Введите фактически отложенную сумму в рублях.\n` +
@@ -558,6 +609,66 @@ async function loadSavingsSummary() {
   }
 }
 
+function closeBulkSelection() {
+  BULK_SELECTION_MODE = false;
+  BULK_SELECTED_DAYS.clear();
+  document.getElementById('bulk-controls').style.display = 'none';
+  document.getElementById('bulk-toggle').style.display = 'inline-block';
+  updateBulkSummary();
+  loadSavings();
+}
+
+document.getElementById('bulk-toggle').addEventListener('click', () => {
+  BULK_SELECTION_MODE = true;
+  BULK_SELECTED_DAYS.clear();
+  document.getElementById('bulk-toggle').style.display = 'none';
+  document.getElementById('bulk-controls').style.display = 'flex';
+  updateBulkSummary();
+  loadSavings();
+});
+
+document.getElementById('bulk-cancel').addEventListener('click', closeBulkSelection);
+document.getElementById('bulk-amount').addEventListener('input', updateBulkSummary);
+
+document.getElementById('bulk-apply').addEventListener('click', async () => {
+  const days = Array.from(BULK_SELECTED_DAYS).sort((a, b) => a - b);
+  const amount = Number(document.getElementById('bulk-amount').value);
+
+  if (!days.length || !Number.isFinite(amount) || amount <= 0) {
+    alert('Выберите дни и укажите сумму больше нуля.');
+    return;
+  }
+
+  const total = amount * days.length;
+  const confirmed = confirm(
+    `Пополнить ${days.length} дн. по ${formatMoney(amount)}?\n` +
+    `Общая сумма: ${formatMoney(total)}`
+  );
+  if (!confirmed) return;
+
+  const applyButton = document.getElementById('bulk-apply');
+  applyButton.disabled = true;
+
+  try {
+    await apiJson(`/api/savings/bulk?goal_id=${encodeURIComponent(ACTIVE_SAVINGS_GOAL_ID)}`, {
+      method: 'POST',
+      body: JSON.stringify({ days, amount })
+    });
+
+    alert(`Готово! Пополнено дней: ${days.length}. Общая сумма: ${formatMoney(total)}.`);
+    BULK_SELECTION_MODE = false;
+    BULK_SELECTED_DAYS.clear();
+    document.getElementById('bulk-controls').style.display = 'none';
+    document.getElementById('bulk-toggle').style.display = 'inline-block';
+    await loadSavings();
+  } catch (error) {
+    alert('Не удалось выполнить массовое пополнение: ' + error.message);
+    updateBulkSummary();
+  } finally {
+    applyButton.disabled = false;
+  }
+});
+
 document.getElementById('settings-save').addEventListener('click', saveSavingsSettings);
 document.getElementById('start-date-input').addEventListener('change', () => {
   const start = document.getElementById('start-date-input').value;
@@ -570,6 +681,12 @@ document.getElementById('end-date-input').addEventListener('change', updateCalen
 document.getElementById('goal-select').addEventListener('change', async (event) => {
   const nextId = Number(event.target.value);
   if (!Number.isInteger(nextId) || nextId <= 0) return;
+
+  BULK_SELECTION_MODE = false;
+  BULK_SELECTED_DAYS.clear();
+  document.getElementById('bulk-controls').style.display = 'none';
+  document.getElementById('bulk-toggle').style.display = 'inline-block';
+
   ACTIVE_SAVINGS_GOAL_ID = nextId;
   await loadSavings();
 });

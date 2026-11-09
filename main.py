@@ -1729,6 +1729,93 @@ async def get_savings(
         conn.close()
 
 
+@app.post("/api/savings/bulk")
+async def bulk_update_savings(
+    item: dict,
+    goal_id: int | None = None,
+    current_user: dict = Depends(get_app_user)
+):
+    days = item.get("days")
+    if not isinstance(days, list) or not days:
+        raise HTTPException(status_code=400, detail="Выберите хотя бы один день")
+    if len(days) > 3650 or any(type(day) is not int or day < 1 or day > 3650 for day in days):
+        raise HTTPException(status_code=400, detail="Некорректный список дней")
+    if len(set(days)) != len(days):
+        raise HTTPException(status_code=400, detail="Список содержит повторяющиеся дни")
+
+    try:
+        amount = float(item.get("amount"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Некорректная сумма")
+    if not math.isfinite(amount) or amount <= 0:
+        raise HTTPException(status_code=400, detail="Сумма должна быть больше нуля")
+
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        goal = _get_savings_goal(conn, current_user["id"], goal_id)
+
+        if any(day > int(goal["days"]) for day in days):
+            raise HTTPException(status_code=400, detail="Один из дней выходит за срок копилки")
+
+        existing = []
+        for offset in range(0, len(days), 900):
+            day_chunk = days[offset:offset + 900]
+            placeholders = ",".join("?" for _ in day_chunk)
+            rows = conn.execute(
+                f"SELECT day, paid FROM savings_goal_entries WHERE goal_id = ? AND day IN ({placeholders})",
+                [goal["id"], *day_chunk],
+            ).fetchall()
+            existing.extend(rows)
+
+        paid_days = [row["day"] for row in existing if row["paid"]]
+        if paid_days:
+            raise HTTPException(
+                status_code=409,
+                detail="Среди выбранных дней есть уже оплаченные. Обновите календарь и выберите другие дни."
+            )
+
+        if current_user.get("is_demo"):
+            existing_days = {row["day"] for row in existing}
+            new_count = len(days) - len(existing_days)
+            entry_count = conn.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM savings_goal_entries e
+                JOIN savings_goals g ON g.id = e.goal_id
+                WHERE g.user_id = ?
+                """,
+                (current_user["id"],),
+            ).fetchone()["n"]
+            if entry_count + new_count > DEMO_MAX_SAVINGS_ENTRIES:
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"В деморежиме достигнут лимит записей календаря ({DEMO_MAX_SAVINGS_ENTRIES})"
+                )
+
+        conn.executemany(
+            """
+            INSERT INTO savings_goal_entries (goal_id, day, amount, paid)
+            VALUES (?, ?, ?, 1)
+            ON CONFLICT(goal_id, day)
+            DO UPDATE SET amount = excluded.amount, paid = 1
+            """,
+            [(goal["id"], day, amount) for day in days],
+        )
+        conn.commit()
+        return {
+            "goal_id": int(goal["id"]),
+            "count": len(days),
+            "amount_per_day": amount,
+            "total": round(amount * len(days), 2),
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 @app.put("/api/savings/{day}")
 async def update_saving(
     day: int,
