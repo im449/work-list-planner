@@ -112,15 +112,15 @@ tbody tr.selected{background:#eff6ff}
     <button class="secondary" onclick="resetForm()">+ Новый платёж</button>
   </div>
   <div class="stats">
-    <div class="stat"><span>Доходы за год</span><strong id="total-income" class="income">0 ₽</strong></div>
-    <div class="stat"><span>Расходы за год</span><strong id="total-expense" class="expense">0 ₽</strong></div>
-    <div class="stat"><span>Баланс за год</span><strong id="total-balance">0 ₽</strong></div>
+    <div class="stat"><span>Получено за год</span><strong id="total-income" class="income">0 ₽</strong></div>
+    <div class="stat"><span>Оплачено за год</span><strong id="total-expense" class="expense">0 ₽</strong></div>
+    <div class="stat"><span>Фактический баланс</span><strong id="total-balance">0 ₽</strong></div>
   </div>
   <h2>План на 12 месяцев</h2>
-  <p class="muted" style="margin:-5px 0 12px">Нажмите на месяц, чтобы отфильтровать платежи. Сводка учитывает все запланированные операции.</p>
+  <p class="muted" style="margin:-5px 0 12px">Нажмите на месяц, чтобы отфильтровать платежи. Доходы и расходы в таблице указаны по плану. Баланс и годовые итоги учитывают только фактически полученные и оплаченные суммы.</p>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Месяц</th><th>Доходы</th><th>Расходы</th><th>Баланс</th><th>Оплачено / выполнение</th></tr></thead>
+      <thead><tr><th>Месяц</th><th>Доходы (план)</th><th>Расходы (план)</th><th>Фактический баланс</th><th>Оплачено / выполнение</th></tr></thead>
       <tbody id="months-body"></tbody>
     </table>
   </div>
@@ -515,24 +515,35 @@ async function loadAll() {
   }
 }
 function renderSummary() {
-  const income = summary.reduce((sum,m) => sum + Number(m.income_kopecks || 0),0);
-  const expense = summary.reduce((sum,m) => sum + Number(m.expense_kopecks || 0),0);
-  $('total-income').textContent = money(income);
-  $('total-expense').textContent = money(expense);
-  $('total-balance').textContent = money(income-expense);
-  $('total-balance').className = income-expense < 0 ? 'balance-negative' : 'balance-positive';
+  const paidIncome = summary.reduce(
+    (sum, m) => sum + Number(m.paid_income_kopecks || 0), 0
+  );
+  const paidExpense = summary.reduce(
+    (sum, m) => sum + Number(m.paid_expense_kopecks || 0), 0
+  );
+  const actualBalance = paidIncome - paidExpense;
 
-  $('months-body').innerHTML = monthNames.map((name,index) => {
-    const m = summary.find(row => Number(row.month) === index+1) || {};
+  $('total-income').textContent = money(paidIncome);
+  $('total-expense').textContent = money(paidExpense);
+  $('total-balance').textContent = money(actualBalance);
+  $('total-balance').className =
+    actualBalance < 0 ? 'balance-negative' : 'balance-positive';
+
+  $('months-body').innerHTML = monthNames.map((name, index) => {
+    const m = summary.find(row => Number(row.month) === index + 1) || {};
     const inc = Number(m.income_kopecks || 0);
     const exp = Number(m.expense_kopecks || 0);
-    const bal = inc-exp;
+    const paidIncome = Number(m.paid_income_kopecks || 0);
     const paid = Number(m.paid_expense_kopecks || 0);
-    const progress = exp > 0 ? Math.min(100, Math.max(0, Math.round(paid / exp * 100))) : 0;
-    return `<tr data-month="${index+1}" class="${String(index+1)===selectedMonth?'selected':''}" onclick="selectMonth(${index+1})">
+    const bal = paidIncome - paid;
+    const progress = exp > 0
+      ? Math.min(100, Math.max(0, Math.round(paid / exp * 100)))
+      : 0;
+
+    return `<tr data-month="${index + 1}" class="${String(index + 1) === selectedMonth ? 'selected' : ''}" onclick="selectMonth(${index + 1})">
       <td class="month-name">${name}</td><td class="income">${money(inc)}</td>
       <td class="expense">${money(exp)}</td>
-      <td class="${bal<0?'balance-negative':'balance-positive'}">${money(bal)}</td>
+      <td class="${bal < 0 ? 'balance-negative' : 'balance-positive'}">${money(bal)}</td>
       <td>
         <div class="progress-amount">${money(paid)}</div>
         <div class="progress-meta">
@@ -544,12 +555,14 @@ function renderSummary() {
       </td></tr>`;
   }).join('');
 }
+
 function selectMonth(month) {
   selectedMonth = String(month);
-  $('month-filter').value = selectedMonth;
+  $("month-filter").value = selectedMonth;
   renderSummary();
   renderItems();
 }
+
 function renderCategoryFilter() {
   const select = $("category-filter");
   if (!select) return;

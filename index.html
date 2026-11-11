@@ -107,6 +107,10 @@
       <input id="auth-password" type="password" autocomplete="current-password" placeholder="Пароль">
       <div id="auth-2fa-area" style="display:none;">
         <input id="auth-2fa-code" type="text" inputmode="numeric" autocomplete="one-time-code" autocapitalize="off" spellcheck="false" maxlength="64" placeholder="Код 2FA или резервный код">
+        <label id="trust-device-label" style="display:none; margin-top:10px; text-align:left;">
+          <input type="checkbox" id="trust-device">
+          Доверять этому устройству 30 дней
+        </label>
       </div>
       <button id="auth-btn" onclick="handleAuth()">Войти</button>
       <button id="demo-start-btn" type="button" onclick="startDemoSession()" style="margin-top:10px;background:#15803d;">Попробовать демо без регистрации</button>
@@ -205,6 +209,11 @@ function toggleMode() {
   const title = document.getElementById('auth-title');
   const btn = document.getElementById('auth-btn');
   const switchText = document.querySelector('.switch-mode');
+  document.getElementById('auth-2fa-area').style.display = 'none';
+  document.getElementById('auth-2fa-code').value = '';
+  document.getElementById('trust-device-label').style.display = 'none';
+  document.getElementById('trust-device').checked = false;
+
   if (isRegisterMode) {
     title.innerText = 'Регистрация';
     btn.innerText = 'Зарегистрироваться';
@@ -241,6 +250,8 @@ async function handleAuth() {
   const twoFactorArea = document.getElementById('auth-2fa-area');
   const twoFactorInput = document.getElementById('auth-2fa-code');
   const authButton = document.getElementById('auth-btn');
+  const trustDeviceLabel = document.getElementById('trust-device-label');
+  const trustDevice = document.getElementById('trust-device');
   const twoFactorRequired = !isRegisterMode && twoFactorArea.style.display !== 'none';
   const twoFactorCode = twoFactorInput.value.trim();
 
@@ -255,6 +266,9 @@ async function handleAuth() {
     const body = new URLSearchParams({username, password});
     if (twoFactorRequired) {
       body.set(/^\d{6}$/.test(twoFactorCode) ? 'totp_code' : 'recovery_code', twoFactorCode);
+      if (trustDevice.checked) {
+        body.set('trust_device', 'true');
+      }
     }
     const options = {
       method: 'POST',
@@ -267,6 +281,7 @@ async function handleAuth() {
       const detail = (await res.clone().json().catch(() => ({}))).detail || '';
       if (detail === 'Требуется TOTP-код или резервный код' && !twoFactorRequired) {
         twoFactorArea.style.display = 'block';
+        trustDeviceLabel.style.display = 'block';
         authButton.innerText = 'Подтвердить код';
         errorEl.innerText = 'Введите код из приложения-аутентификатора или резервный код';
         errorEl.style.display = 'block';
@@ -294,6 +309,8 @@ async function handleAuth() {
       sessionStorage.removeItem('demo_ended');
       twoFactorArea.style.display = 'none';
       twoFactorInput.value = '';
+      trustDeviceLabel.style.display = 'none';
+      trustDevice.checked = false;
       authButton.innerText = 'Войти';
       localStorage.setItem('auth_token', data.access_token);
       localStorage.setItem('username', username);

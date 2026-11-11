@@ -802,6 +802,7 @@ def test_budget_summary_returns_twelve_months_and_totals():
         amount_kopecks=30000000,
         item_type="income",
         due_date="2026-01-05",
+        status="paid",
     )
     expense = create_budget_item(
         headers,
@@ -846,7 +847,7 @@ def test_budget_summary_returns_twelve_months_and_totals():
     assert january["month"] == 1
     assert january["income_kopecks"] == 30000000
     assert january["expense_kopecks"] == 12500000
-    assert january["balance_kopecks"] == 17500000
+    assert january["balance_kopecks"] == 20000000
     assert january["paid_expense_kopecks"] == 10000000
     assert january["mandatory_expense_kopecks"] == 10000000
 

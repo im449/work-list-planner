@@ -304,6 +304,21 @@ def init_db():
             )
         """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_demo_sessions_activity ON demo_sessions(last_activity, expires_at)")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS trusted_devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                device_name TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            )
+        """)
+        c.execute("""
+            CREATE INDEX IF NOT EXISTS idx_trusted_devices_user
+            ON trusted_devices(user_id, expires_at)
+        """)
     conn.commit()
     conn.close()
 
@@ -370,6 +385,46 @@ def hash_recovery_code(code: str) -> str:
     """Хеширует случайный резервный код перед сохранением."""
     normalized = code.replace("-", "").replace(" ", "").upper()
     return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def hash_trusted_device_token(token: str) -> str:
+    """Хеширует токен доверенного устройства."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def create_trusted_device(conn, user_id: int, device_name: str) -> str:
+    """Создаёт доверенное устройство сроком на 30 дней."""
+    now = int(time.time())
+    token = secrets.token_urlsafe(32)
+    conn.execute(
+        """
+        INSERT INTO trusted_devices
+            (user_id, token_hash, device_name, created_at, last_used_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            hash_trusted_device_token(token),
+            (device_name or "Неизвестное устройство")[:160],
+            now,
+            now,
+            now + 30 * 24 * 60 * 60,
+        ),
+    )
+    return token
+
+
+def set_trusted_device_cookie(response: Response, token: str) -> None:
+    """Устанавливает защищённую cookie доверенного устройства."""
+    response.set_cookie(
+        key="trusted_device",
+        value=token,
+        max_age=30 * 24 * 60 * 60,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
 
 
 def generate_recovery_codes(count: int = 8) -> list[str]:
@@ -751,6 +806,10 @@ async def confirm_totp(
                 current_user["id"],
             ),
         )
+        conn.execute(
+            "DELETE FROM trusted_devices WHERE user_id = ?",
+            (current_user["id"],),
+        )
         conn.commit()
 
         return {
@@ -803,6 +862,10 @@ async def change_password(
                WHERE id = ?""",
             (get_password_hash(data.new_password), current_user["id"]),
         )
+        conn.execute(
+            "DELETE FROM trusted_devices WHERE user_id = ?",
+            (current_user["id"],),
+        )
         conn.commit()
         return {"status": "ok", "message": "Пароль успешно изменён"}
     except Exception:
@@ -820,7 +883,11 @@ async def read_current_user(current_user: dict = Depends(get_current_user)):
 # === ЭНДПОИНТЫ АВТОРИЗАЦИИ ===
 @app.post("/token")
 @limiter.limit("10/minute")
-async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):
+async def login(
+    request: Request,
+    response: Response,
+    form_data: OAuth2PasswordRequestForm = Depends(),
+):
     user = authenticate_user(form_data.username, form_data.password)
     if not user:
         raise HTTPException(
@@ -832,6 +899,9 @@ async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends
     form = await request.form()
     totp_code = (form.get("totp_code") or "").strip()
     recovery_code = (form.get("recovery_code") or "").strip()
+    trust_device = form.get("trust_device") == "true"
+    device_cookie = request.cookies.get("trusted_device")
+    new_device_token = None
 
     conn = db()
     try:
@@ -843,45 +913,80 @@ async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends
         ).fetchone()
 
         if row and row["totp_enabled"]:
-            if bool(totp_code) == bool(recovery_code):
-                raise HTTPException(
-                    status_code=401,
-                    detail="Требуется TOTP-код или резервный код",
-                )
+            trusted = False
 
-            if totp_code:
-                try:
-                    secret = decrypt_totp_secret(row["totp_secret"])
-                except (InvalidToken, AttributeError, TypeError, ValueError):
-                    secret = ""
+            if not totp_code and not recovery_code and device_cookie:
+                trusted_row = conn.execute(
+                    """
+                    SELECT id FROM trusted_devices
+                    WHERE user_id = ? AND token_hash = ? AND expires_at > ?
+                    """,
+                    (
+                        user["id"],
+                        hash_trusted_device_token(device_cookie),
+                        int(time.time()),
+                    ),
+                ).fetchone()
 
-                if not secret or not verify_totp_code(secret, totp_code):
+                if trusted_row:
+                    conn.execute(
+                        "UPDATE trusted_devices SET last_used_at = ? WHERE id = ?",
+                        (int(time.time()), trusted_row["id"]),
+                    )
+                    trusted = True
+
+            if not trusted:
+                if bool(totp_code) == bool(recovery_code):
                     raise HTTPException(
                         status_code=401,
-                        detail="Неверный код 2FA",
-                    )
-            else:
-                try:
-                    hashes = json.loads(row["recovery_codes_hashes"] or "[]")
-                except (TypeError, ValueError):
-                    hashes = []
-
-                code_hash = hash_recovery_code(recovery_code)
-                if code_hash not in hashes:
-                    raise HTTPException(
-                        status_code=401,
-                        detail="Неверный или уже использованный резервный код",
+                        detail="Требуется TOTP-код или резервный код",
                     )
 
-                hashes.remove(code_hash)
-                conn.execute(
-                    "UPDATE users SET recovery_codes_hashes = ? WHERE id = ?",
-                    (json.dumps(hashes), user["id"]),
-                )
+                if totp_code:
+                    try:
+                        secret = decrypt_totp_secret(row["totp_secret"])
+                    except (InvalidToken, AttributeError, TypeError, ValueError):
+                        secret = ""
+
+                    if not secret or not verify_totp_code(secret, totp_code):
+                        raise HTTPException(
+                            status_code=401,
+                            detail="Неверный код 2FA",
+                        )
+                else:
+                    try:
+                        hashes = json.loads(row["recovery_codes_hashes"] or "[]")
+                    except (TypeError, ValueError):
+                        hashes = []
+
+                    code_hash = hash_recovery_code(recovery_code)
+                    if code_hash not in hashes:
+                        raise HTTPException(
+                            status_code=401,
+                            detail="Неверный или уже использованный резервный код",
+                        )
+
+                    hashes.remove(code_hash)
+                    conn.execute(
+                        "UPDATE users SET recovery_codes_hashes = ? WHERE id = ?",
+                        (json.dumps(hashes), user["id"]),
+                    )
+
+                if trust_device:
+                    device_name = request.headers.get("user-agent", "")
+                    new_device_token = create_trusted_device(
+                        conn, user["id"], device_name
+                    )
 
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
+
+    if new_device_token:
+        set_trusted_device_cookie(response, new_device_token)
 
     access_token = create_access_token(
         data={"sub": user["username"], "ver": user["token_version"]},
@@ -2389,6 +2494,10 @@ async def budget_summary(
                     THEN amount_kopecks ELSE 0 END
                 ), 0) AS expense_kopecks,
                 COALESCE(SUM(
+                    CASE WHEN item_type = 'income' AND status = 'paid'
+                    THEN amount_kopecks ELSE 0 END
+                ), 0) AS paid_income_kopecks,
+                COALESCE(SUM(
                     CASE WHEN item_type = 'expense' AND status = 'paid'
                     THEN amount_kopecks ELSE 0 END
                 ), 0) AS paid_expense_kopecks,
@@ -2410,15 +2519,16 @@ async def budget_summary(
             row = by_month.get(month, {})
             income = int(row.get("income_kopecks", 0))
             expense = int(row.get("expense_kopecks", 0))
+            paid_income = int(row.get("paid_income_kopecks", 0))
+            paid_expense = int(row.get("paid_expense_kopecks", 0))
 
             months.append({
                 "month": month,
                 "income_kopecks": income,
                 "expense_kopecks": expense,
-                "balance_kopecks": income - expense,
-                "paid_expense_kopecks": int(
-                    row.get("paid_expense_kopecks", 0)
-                ),
+                "paid_income_kopecks": paid_income,
+                "paid_expense_kopecks": paid_expense,
+                "balance_kopecks": paid_income - paid_expense,
                 "mandatory_expense_kopecks": int(
                     row.get("mandatory_expense_kopecks", 0)
                 ),
